@@ -1,0 +1,526 @@
+
+/* ========================================
+   PAGE
+======================================== */
+
+.choose-method-page,
+.choose-method-page * {
+  box-sizing: border-box;
+}
+
+.choose-method-page {
+  width: 100%;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #f4f7fb;
+  color: #1e293b;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+
+/* ========================================
+   HEADER - SAME AS PROCESSING PAGE
+======================================== */
+
+.processing-header {
+  width: 100%;
+  min-height: 76px;
+  padding: 12px 28px;
+
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+
+  flex-shrink: 0;
+  background: #194779;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 2px 8px rgba(15, 39, 71, 0.08);
+
+  position: relative;
+  z-index: 10;
+}
+
+.processing-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.processing-brand-icon {
+  width: 42px;
+  height: 42px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  flex-shrink: 0;
+  color: #ffffff;
+}
+
+.processing-brand-text h2 {
+  margin: 0 0 4px;
+  color: #ffffff;
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+}
+
+.processing-brand-text p {
+  margin: 0;
+  color: #e0eaf8;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+
+/* ========================================
+   MAIN AREA - CENTER CONTENT
+======================================== */
+
+.choose-method-main {
+  width: 100%;
+  flex: 1;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 35px 28px;
+}
+
+.choose-method-content {
+  width: 100%;
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+
+/* ========================================
+   HEADING
+======================================== */
+
+.choose-method-heading {
+  text-align: center;
+  margin: 0 auto 38px;
+}
+
+.heading-label {
+  display: inline-block;
+  margin-bottom: 12px;
+
+  color: #4f46e5;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+
+  padding: 7px 15px;
+  border-radius: 20px;
+  background: #eef2ff;
+}
+
+.choose-method-heading h1 {
+  margin: 0 0 12px;
+  color: #172554;
+  font-size: 34px;
+  line-height: 1.25;
+  font-weight: 800;
+}
+
+.choose-method-heading p {
+  margin: 0;
+  color: #64748b;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+
+/* ========================================
+   METHOD CARDS - CENTERED
+======================================== */
+
+.method-grid {
+  width: 100%;
+  max-width: 850px;
+  margin: 0 auto;
+
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 28px;
+}
+
+
+/* ========================================
+   CARD
+======================================== */
+
+.method-card {
+  width: 100%;
+  min-height: 310px;
+  padding: 34px 30px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+  border: 1px solid #dce5f1;
+  border-radius: 17px;
+  background: #ffffff;
+
+  box-shadow: 0 6px 22px rgba(15, 39, 71, 0.06);
+
+  color: #172033;
+  font-family: inherit;
+  text-align: center;
+  cursor: pointer;
+
+  transition:
+    transform 0.22s ease,
+    border-color 0.22s ease,
+    box-shadow 0.22s ease;
+}
+
+.method-card:hover {
+  transform: translateY(-4px);
+  border-color: #8ab4ff;
+  box-shadow: 0 12px 28px rgba(23, 105, 255, 0.10);
+}
+
+.method-card:focus-visible {
+  outline: 3px solid rgba(23, 105, 255, 0.3);
+  outline-offset: 4px;
+}
+
+.method-card:active {
+  transform: translateY(-1px);
+}
+
+
+/* ========================================
+   CARD ICONS
+======================================== */
+
+.method-icon {
+  width: 76px;
+  height: 76px;
+  margin-bottom: 23px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 19px;
+  flex-shrink: 0;
+}
+
+.camera-icon {
+  color: #315dcc;
+  background: #eaf1ff;
+}
+
+.upload-icon {
+  color: #315dcc;
+  background: #eaf1ff;
+}
+
+
+/* ========================================
+   CARD TITLES
+======================================== */
+
+.method-card h2 {
+  margin: 0 0 12px;
+  color: #172554;
+  font-size: 21px;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
+
+/* ========================================
+   CARD DESCRIPTIONS
+======================================== */
+
+.method-card p {
+  width: 100%;
+  max-width: 310px;
+  min-height: 46px;
+
+  margin: 0 0 20px;
+  color: #64748b;
+
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+
+/* ========================================
+   ACTION TEXT
+======================================== */
+
+.method-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+
+  color: #315dcc;
+  font-size: 14px;
+  font-weight: 700;
+
+  transition: gap 0.2s ease;
+}
+
+.method-card:hover .method-action {
+  gap: 11px;
+}
+
+
+/* ========================================
+   BACK BUTTON
+======================================== */
+
+.choose-method-actions {
+  width: 100%;
+  max-width: 850px;
+  margin: 30px auto 0;
+
+  display: flex;
+  justify-content: flex-start;
+}
+
+.method-back-button {
+  min-height: 43px;
+  padding: 0 19px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+
+  border: 1px solid #d7e4f6;
+  border-radius: 8px;
+
+  background: #eef4fc;
+  color: #466486;
+
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+
+  transition: background 0.2s ease;
+}
+
+.method-back-button:hover {
+  background: #e3edfc;
+}
+
+
+/* ========================================
+   FOOTER - MATCHING HEADER
+======================================== */
+
+.choose-method-footer {
+  width: 100%;
+  min-height: 60px;
+  padding: 12px 20px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  flex-shrink: 0;
+  background: #194779;
+}
+
+.choose-method-footer-content {
+  width: 100%;
+  max-width: 1200px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 13px;
+}
+
+.choose-method-footer-logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 20px;
+}
+
+.choose-method-footer-divider {
+  width: 1px;
+  height: 23px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.choose-method-footer-content p {
+  margin: 0;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+
+/* ========================================
+   TABLET
+======================================== */
+
+@media (max-width: 800px) {
+  .choose-method-main {
+    padding: 32px 22px;
+  }
+
+  .choose-method-content {
+    max-width: 650px;
+  }
+
+  .choose-method-heading {
+    margin-bottom: 30px;
+  }
+
+  .method-grid {
+    gap: 18px;
+  }
+
+  .method-card {
+    min-height: 285px;
+    padding: 28px 20px;
+  }
+
+  .method-card h2 {
+    font-size: 19px;
+  }
+}
+
+
+/* ========================================
+   MOBILE
+======================================== */
+
+@media (max-width: 600px) {
+  .processing-header {
+    min-height: 68px;
+    padding: 10px 16px;
+  }
+
+  .processing-brand {
+    gap: 8px;
+  }
+
+  .processing-brand-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .processing-brand-icon svg {
+    width: 26px;
+    height: 26px;
+  }
+
+  .processing-brand-text h2 {
+    font-size: 17px;
+  }
+
+  .processing-brand-text p {
+    max-width: 260px;
+    font-size: 10px;
+  }
+
+  .choose-method-main {
+    padding: 32px 16px;
+  }
+
+  .choose-method-heading {
+    margin-bottom: 26px;
+  }
+
+  .choose-method-heading h1 {
+    font-size: 28px;
+  }
+
+  .choose-method-heading p {
+    font-size: 14px;
+  }
+
+  .method-grid {
+    max-width: 420px;
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .method-card {
+    min-height: 245px;
+    padding: 26px 22px;
+  }
+
+  .method-icon {
+    width: 65px;
+    height: 65px;
+    margin-bottom: 18px;
+  }
+
+  .method-icon svg {
+    width: 32px;
+    height: 32px;
+  }
+
+  .method-card h2 {
+    font-size: 19px;
+  }
+
+  .method-card p {
+    min-height: auto;
+    font-size: 13px;
+  }
+
+  .choose-method-actions {
+    max-width: 420px;
+    margin-top: 22px;
+  }
+
+  .choose-method-footer {
+    min-height: 58px;
+    padding: 10px 12px;
+  }
+
+  .choose-method-footer-content {
+    gap: 8px;
+  }
+
+  .choose-method-footer-logo {
+    font-size: 17px;
+  }
+
+  .choose-method-footer-divider {
+    height: 19px;
+  }
+
+  .choose-method-footer-content p {
+    font-size: 8px;
+    letter-spacing: 0.1px;
+  }
+}
+
+
+/* ========================================
+   REDUCED MOTION
+======================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .method-card,
+  .method-action,
+  .method-back-button {
+    transition: none;
+  }
+}

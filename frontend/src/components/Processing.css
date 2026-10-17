@@ -1,0 +1,471 @@
+
+/* =========================
+   PAGE
+========================= */
+.processing-page,
+.processing-page * {
+  box-sizing: border-box;
+}
+
+.processing-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #f4f7fb;
+  color: #1e293b;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* =========================
+   BLUE HEADER
+========================= */
+.processing-header {
+  width: 100%;
+  min-height: 76px;
+  padding: 12px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-shrink: 0;
+  background: #194779;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 2px 8px rgba(15, 39, 71, 0.08);
+  position: relative;
+  z-index: 10;
+}
+
+.processing-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.processing-brand-icon {
+  width: 42px;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #ffffff;
+}
+
+.processing-brand-text h2 {
+  margin: 0 0 4px;
+  color: #ffffff;
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+}
+
+.processing-brand-text p {
+  margin: 0;
+  color: #e0eaf8;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* =========================
+   CENTER CONTENT
+========================= */
+.processing-container {
+  width: 100%;
+  max-width: 850px;
+  flex: 1;
+  margin: 0 auto;
+  padding: 30px 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.processing-container > * {
+  flex-shrink: 0;
+}
+
+/* STEP LABEL */
+.processing-step-label {
+  display: inline-block;
+  width: fit-content;
+  margin: 0 0 16px;
+  padding: 8px 16px;
+  border-radius: 20px;
+  background: #eef2ff;
+  color: #4f46e5;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+/* MAIN HEADING */
+.processing-container h1 {
+  width: 100%;
+  margin: 0 0 12px;
+  color: #172554;
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.processing-status {
+  width: 100%;
+  margin: 0 0 36px;
+  color: #64748b;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+/* =========================
+   PROCESS STEPS
+========================= */
+.process-steps {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin: 0 auto 42px;
+}
+
+.process-step {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: #94a3b8;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.step-icon {
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 50%;
+  background: #ffffff;
+  color: #64748b;
+  font-size: 14px;
+  font-weight: 700;
+  transition: all 0.25s ease;
+}
+
+.step-icon.active {
+  border-color: #4f46e5;
+  background: #4f46e5;
+  color: #ffffff;
+  box-shadow: 0 0 0 5px #e0e7ff;
+}
+
+.step-icon.completed {
+  border-color: #16a34a;
+  background: #16a34a;
+  color: #ffffff;
+}
+
+/* =========================
+   LOADING SPINNER
+========================= */
+.loader-ring {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 24px;
+  border: 5px solid #e0e7ff;
+  border-top-color: #4f46e5;
+  border-radius: 50%;
+  animation: processing-spin 1s linear infinite;
+}
+
+.loader-ring.loader-error {
+  border-color: #fee2e2;
+  border-top-color: #dc2626;
+  animation: none;
+}
+
+.processing-container h2 {
+  width: 100%;
+  margin: 0 0 22px;
+  color: #334155;
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* =========================
+   PROGRESS BAR
+========================= */
+.progress-wrapper {
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border-radius: 20px;
+  background: #e2e8f0;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #4f46e5, #818cf8);
+  transition: width 0.3s ease;
+}
+
+.progress-value {
+  width: 100%;
+  margin-top: 12px;
+  color: #4f46e5;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: right;
+}
+
+/* =========================
+   ERROR MESSAGE
+========================= */
+.processing-error {
+  width: 100%;
+  margin-top: 24px;
+  padding: 16px;
+  border: 1px solid #fecaca;
+  border-radius: 12px;
+  background: #fef2f2;
+  color: #b91c1c;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.processing-error p {
+  margin: 0 0 14px;
+  line-height: 1.6;
+}
+
+.processing-back-btn {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+  background: #4f46e5;
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.processing-back-btn:hover {
+  background: #4338ca;
+}
+
+/* =========================
+   BLUE FOOTER
+========================= */
+.processing-footer {
+  width: 100%;
+  min-height: 60px;
+  margin-top: auto;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: #194779;
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.processing-footer-content {
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.processing-footer-logo {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.processing-footer-title {
+  margin: 0;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.35px;
+  line-height: 1.5;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+/* =========================
+   SPINNER ANIMATION
+========================= */
+@keyframes processing-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* =========================
+   TABLET
+========================= */
+@media (min-width: 601px) and (max-width: 900px) {
+  .processing-container {
+    max-width: 760px;
+    padding: 30px 24px;
+  }
+
+  .process-steps {
+    gap: 8px;
+  }
+
+  .process-step {
+    font-size: 11px;
+  }
+}
+
+/* =========================
+   MOBILE
+========================= */
+@media (max-width: 600px) {
+  .processing-header {
+    min-height: 68px;
+    padding: 10px 16px;
+  }
+
+  .processing-brand {
+    gap: 8px;
+  }
+
+  .processing-brand-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .processing-brand-icon svg {
+    width: 26px;
+    height: 26px;
+  }
+
+  .processing-brand-text h2 {
+    font-size: 17px;
+  }
+
+  .processing-brand-text p {
+    max-width: 260px;
+    font-size: 10px;
+  }
+
+  .processing-container {
+    padding: 28px 16px;
+  }
+
+  .processing-container h1 {
+    font-size: 26px;
+  }
+
+  .processing-status {
+    margin-bottom: 28px;
+    font-size: 14px;
+  }
+
+  .process-steps {
+    gap: 5px;
+    margin-bottom: 34px;
+  }
+
+  .process-step {
+    gap: 8px;
+    font-size: 10px;
+    overflow-wrap: anywhere;
+  }
+
+  .step-icon {
+    width: 32px;
+    height: 32px;
+    font-size: 12px;
+  }
+
+  .loader-ring {
+    width: 56px;
+    height: 56px;
+    margin-bottom: 20px;
+  }
+
+  .processing-container h2 {
+    font-size: 17px;
+    margin-bottom: 20px;
+  }
+
+  .progress-wrapper {
+    height: 8px;
+  }
+
+  .processing-footer {
+    min-height: 60px;
+    padding: 10px 12px;
+  }
+
+  .processing-footer-content {
+    gap: 8px;
+  }
+
+  .processing-footer-logo {
+    width: 26px;
+    height: 26px;
+    font-size: 18px;
+  }
+
+  .processing-footer-title {
+    font-size: 9px;
+    letter-spacing: 0.15px;
+  }
+}
+
+/* SHORT SCREEN HEIGHT */
+@media (max-height: 650px) and (min-width: 601px) {
+  .processing-container {
+    padding-top: 16px;
+    padding-bottom: 16px;
+  }
+
+  .processing-step-label {
+    margin-bottom: 10px;
+  }
+
+  .processing-status {
+    margin-bottom: 22px;
+  }
+
+  .process-steps {
+    margin-bottom: 26px;
+  }
+
+  .loader-ring {
+    width: 52px;
+    height: 52px;
+    margin-bottom: 16px;
+  }
+
+  .processing-container h2 {
+    margin-bottom: 16px;
+  }
+}

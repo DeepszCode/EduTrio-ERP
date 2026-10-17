@@ -1,0 +1,710 @@
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+
+/* RESET */
+* {
+  box-sizing: border-box;
+}
+
+.scan-page {
+  --navy: #1b4778;
+  --primary: #2464ff;
+  --text: #103e7c;
+  --muted: #7185a3;
+
+  width: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
+  margin: 0;
+  padding: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  overflow-x: hidden;
+  background: #f5f8fd;
+  color: var(--text);
+  font-family: "Inter", Arial, sans-serif;
+}
+
+/* FULL-WIDTH HEADER */
+.scan-header {
+  width: 100%;
+  min-height: 72px;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0 24px;
+
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 16px;
+
+  background: var(--navy);
+  color: #fff;
+  border: none;
+  border-radius: 0;
+  box-shadow: 0 2px 6px rgba(15, 40, 75, 0.12);
+  z-index: 10;
+}
+
+.scan-header-back {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 10px;
+
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.scan-header-back:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.scan-header-back:focus-visible,
+.primary-btn:focus-visible,
+.outline-btn:focus-visible,
+.tool-button:focus-visible {
+  outline: 3px solid rgba(36, 100, 255, 0.35);
+  outline-offset: 3px;
+}
+
+.scan-header-logo {
+  width: 30px;
+  height: 34px;
+  flex-shrink: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+}
+
+.scan-header-brand {
+  color: #fff;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* MAIN CONTENT */
+.scan-content {
+  width: 100%;
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 28px 30px 32px;
+
+  flex: 1;
+}
+
+.scan-page-heading {
+  margin-bottom: 27px;
+}
+
+.scan-step {
+  margin-bottom: 3px;
+  color: #17457d;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+
+.scan-page-heading h1 {
+  margin: 0 0 9px;
+  color: #104481;
+  font-size: 28px;
+  font-weight: 750;
+  line-height: 1.25;
+}
+
+.scan-page-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+/* CAMERA AND TOOLS — CENTERED */
+.capture-layout {
+  width: 100%;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+}
+
+/* CAMERA CARD */
+.camera-box {
+  width: 100%;
+  max-width: 1000px;
+  min-width: 0;
+  flex: 1;
+
+  padding: 14px;
+  background: #fff;
+  border: 1px solid #edf1f8;
+  border-radius: 13px;
+  box-shadow: 0 4px 18px rgba(23, 50, 90, 0.07);
+}
+
+/* PROFESSIONAL LANDSCAPE CERTIFICATE CAMERA */
+.camera-wrapper {
+  position: relative;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1.414 / 1;
+  max-height: 560px;
+  min-height: 280px;
+
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: #000;
+  border-radius: 9px;
+}
+
+.camera-feed {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+/* CAMERA STATUS */
+.camera-status {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+
+  padding: 6px 9px;
+  border-radius: 5px;
+
+  background: rgba(0, 0, 0, 0.55);
+  color: #dbe7ff;
+  font-size: 11px;
+  z-index: 2;
+}
+
+.camera-status.ready {
+  color: #b7f7ce;
+}
+
+/* SCANNER FRAME */
+.scanner-frame {
+  position: absolute;
+  inset: 18px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.corner {
+  position: absolute;
+  width: 37px;
+  height: 37px;
+  border: 4px solid #fff;
+}
+
+.corner.tl {
+  top: 0;
+  left: 0;
+  border-right: none;
+  border-bottom: none;
+}
+
+.corner.tr {
+  top: 0;
+  right: 0;
+  border-left: none;
+  border-bottom: none;
+}
+
+.corner.bl {
+  bottom: 0;
+  left: 0;
+  border-right: none;
+  border-top: none;
+}
+
+.corner.br {
+  right: 0;
+  bottom: 0;
+  border-left: none;
+  border-top: none;
+}
+
+/* CAPTURED CERTIFICATE — MATCH CAMERA FRAME */
+.captured-wrapper {
+  position: relative;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1.414 / 1;
+  max-height: 560px;
+  min-height: 280px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  overflow: hidden;
+  border-radius: 9px;
+  background: #111827;
+}
+
+.captured-preview {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transition: filter 0.2s ease, transform 0.2s ease;
+}
+
+.captured-preview.image-enhanced {
+  filter: contrast(1.12) brightness(1.06) saturate(1.05);
+}
+
+.scanned-label {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+
+  padding: 8px 12px;
+  border-radius: 7px;
+
+  background: #e7f9ed;
+  color: #187344;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* CAMERA ERROR */
+.camera-error {
+  width: 100%;
+  padding: 30px 20px;
+  text-align: center;
+  color: #fff;
+}
+
+.camera-error-icon {
+  margin-bottom: 12px;
+  font-size: 38px;
+}
+
+.camera-error h3 {
+  margin: 0 0 9px;
+  font-size: 18px;
+}
+
+.camera-error p {
+  max-width: 350px;
+  margin: 0 auto 18px;
+  color: #d1d5db;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* RIGHT-SIDE CAMERA TOOLS */
+.camera-tools {
+  width: 190px;
+  flex-shrink: 0;
+
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.tool-card {
+  width: 100%;
+  min-height: 75px;
+  padding: 17px 19px;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  border: 1px solid #edf1f8;
+  border-radius: 12px;
+  background: #fff;
+  color: #17457d;
+
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+
+  box-shadow: 0 3px 10px rgba(23, 50, 90, 0.05);
+}
+
+.tool-button {
+  min-height: 75px;
+  border: 1px solid #d9e0ea;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.tool-button:hover:not(:disabled) {
+  background: #f0f5ff;
+  border-color: #9bb7ff;
+}
+
+.tool-button:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.tool-button.tool-active {
+  background: #edf3ff;
+  border-color: #8eacff;
+}
+
+.tool-icon {
+  color: #ff9255;
+  font-size: 18px;
+}
+
+/* AUTO-CROP SWITCH */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.slider {
+  position: absolute;
+  inset: 0;
+  border-radius: 30px;
+  background: #cbd5e1;
+  cursor: pointer;
+  transition: background 0.25s ease;
+}
+
+.slider::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
+  transition: transform 0.25s ease;
+}
+
+.switch input:checked + .slider {
+  background: var(--primary);
+}
+
+.switch input:checked + .slider::before {
+  transform: translateX(20px);
+}
+
+.switch input:focus-visible + .slider {
+  outline: 3px solid rgba(36, 100, 255, 0.3);
+  outline-offset: 3px;
+}
+
+/* ACTION BUTTONS */
+.capture-actions {
+  width: 100%;
+  margin-top: 26px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.outline-btn,
+.primary-btn {
+  min-width: 168px;
+  min-height: 46px;
+  padding: 11px 20px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+
+  border-radius: 9px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.outline-btn {
+  border: 1px solid var(--primary);
+  background: #fff;
+  color: var(--primary);
+}
+
+.outline-btn:hover {
+  background: #eef4ff;
+  transform: translateY(-1px);
+}
+
+.primary-btn {
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(36, 100, 255, 0.18);
+}
+
+.primary-btn:hover:not(:disabled) {
+  background: #1d4ed8;
+  transform: translateY(-1px);
+}
+
+.primary-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* FOOTER AT PAGE BOTTOM */
+.scan-footer {
+  width: 100%;
+  min-height: 48px;
+  flex-shrink: 0;
+
+  margin-top: auto;
+  padding: 10px 18px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: #1b4778;
+  color: #fff;
+  box-sizing: border-box;
+}
+
+.scan-footer-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+
+  text-align: center;
+  line-height: 1.4;
+}
+
+.scan-footer-logo {
+  flex-shrink: 0;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.scan-footer-title {
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.25px;
+}
+
+/* TABLET */
+@media (max-width: 1000px) {
+  .scan-content {
+    padding: 25px 22px 30px;
+  }
+
+  .capture-layout {
+    gap: 16px;
+  }
+
+  .camera-wrapper,
+  .captured-wrapper {
+    min-height: 250px;
+  }
+
+  .camera-tools {
+    width: 175px;
+  }
+
+  .tool-card {
+    padding: 15px;
+  }
+}
+
+/* SMALL TABLET */
+@media (max-width: 800px) {
+  .capture-layout {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .camera-box {
+    width: 100%;
+    max-width: 760px;
+    flex: none;
+  }
+
+  .camera-wrapper,
+  .captured-wrapper {
+    min-height: 0;
+    max-height: none;
+  }
+
+  .camera-tools {
+    width: 100%;
+    max-width: 760px;
+
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .tool-card {
+    min-height: 66px;
+  }
+}
+
+/* MOBILE */
+@media (max-width: 600px) {
+  .scan-header {
+    min-height: 64px;
+    padding: 0 12px;
+    gap: 11px;
+  }
+
+  .scan-header-back {
+    width: 35px;
+    height: 35px;
+  }
+
+  .scan-header-logo {
+    width: 26px;
+  }
+
+  .scan-header-brand {
+    font-size: 18px;
+  }
+
+  .scan-content {
+    padding: 22px 14px 26px;
+  }
+
+  .scan-page-heading {
+    margin-bottom: 20px;
+  }
+
+  .scan-page-heading h1 {
+    font-size: 24px;
+  }
+
+  .scan-page-heading p {
+    font-size: 12px;
+  }
+
+  .camera-box {
+    padding: 9px;
+  }
+
+  .camera-wrapper,
+  .captured-wrapper {
+    aspect-ratio: 1.2 / 1;
+    min-height: 0;
+  }
+
+  .scanner-frame {
+    inset: 12px;
+  }
+
+  .corner {
+    width: 29px;
+    height: 29px;
+    border-width: 3px;
+  }
+
+  .camera-tools {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
+
+  .tool-card {
+    min-height: 59px;
+    padding: 13px 15px;
+  }
+
+  .capture-actions {
+    margin-top: 20px;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .outline-btn,
+  .primary-btn {
+    width: 100%;
+    max-width: 340px;
+    min-height: 46px;
+  }
+
+  .scan-footer {
+    min-height: 48px;
+    padding: 9px 10px;
+  }
+
+  .scan-footer-content {
+    gap: 6px;
+  }
+
+  .scan-footer-logo {
+    font-size: 15px;
+  }
+
+  .scan-footer-title {
+    font-size: 8px;
+    letter-spacing: 0.1px;
+  }
+}
+
+/* SHORT SCREENS */
+@media (max-height: 650px) and (min-width: 801px) {
+  .scan-content {
+    padding-top: 18px;
+    padding-bottom: 22px;
+  }
+
+  .scan-page-heading {
+    margin-bottom: 18px;
+  }
+
+  .camera-wrapper,
+  .captured-wrapper {
+    max-height: 430px;
+    min-height: 0;
+  }
+
+  .tool-card {
+    min-height: 62px;
+  }
+}
