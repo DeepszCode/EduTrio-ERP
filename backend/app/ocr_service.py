@@ -3,43 +3,85 @@ ocr_service.py - SMART ERP
 Text extraction (PDF / image) + certificate field parsing + validation.
 Every parser returns a dict whose keys match the columns in your SQL tables.
 """
+import copy
 import io
 import os
 import re
+import shutil
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
 
 import cv2
 import numpy as np
-import pymupdf as fitz  # PyMuPDF
+import pymupdf as fitz
 import pytesseract
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
-load_dotenv()  # must run before os.getenv() below
+load_dotenv()
 
-TESS_LANG = (os.getenv("OCR_LANGUAGES") or os.getenv("TESS_LANG") or "eng").replace(",", "+").replace(" ", "")
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOCAL_TESSDATA = BASE_DIR / "tessdata"
+if LOCAL_TESSDATA.exists():
+    os.environ["TESSDATA_PREFIX"] = str(LOCAL_TESSDATA)
+
+TESS_LANG = (os.getenv("OCR_LANGUAGES") or os.getenv("TESS_LANG") or "eng+tam").replace(",", "+").replace(" ", "")
+
+def _available_ocr_languages() -> set:
+    """Return installed Tesseract language codes; empty set means detection was unavailable."""
+    try:
+        return set(pytesseract.get_languages(config=""))
+    except Exception:
+        return set()
+
+def _effective_ocr_lang(requested: str = TESS_LANG) -> str:
+    """Use requested languages that are installed; fall back to English when Tamil data is absent."""
+    available = _available_ocr_languages()
+    if not available:
+        return requested or "eng"
+    wanted = [part for part in (requested or "eng").split("+") if part in available]
+    if "eng" in available and "eng" not in wanted:
+        wanted.insert(0, "eng")
+    return "+".join(dict.fromkeys(wanted)) or ("eng" if "eng" in available else next(iter(available)))
 MIN_PDF_TEXT_CHARS = 80
 PDF_DPI = 300
 
-# Tesseract path: .env value first, else the default Windows install location
+# Windows Tesseract path: checks .env, default Program Files, AppData user location, or PATH
 _DEFAULT_TESS = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_USER_TESS = os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
 _tess_cmd = (os.getenv("TESSERACT_CMD") or "").strip().strip('"')
-if not _tess_cmd and os.path.exists(_DEFAULT_TESS):
-    _tess_cmd = _DEFAULT_TESS
-if _tess_cmd:
+
+if not _tess_cmd or not os.path.exists(_tess_cmd):
+    if os.path.exists(_DEFAULT_TESS):
+        _tess_cmd = _DEFAULT_TESS
+    elif os.path.exists(_USER_TESS):
+        _tess_cmd = _USER_TESS
+    else:
+        _which = shutil.which("tesseract")
+        if _which:
+            _tess_cmd = _which
+
+if _tess_cmd and os.path.exists(_tess_cmd):
     pytesseract.pytesseract.tesseract_cmd = _tess_cmd
 
 TEXT, DATE, INT, NUM = "text", "date", "int", "num"
 
 
 # ----------------------------------------------------------------------------
-# 1. Text extraction
+# 1. Text extraction & Preprocessing
 # ----------------------------------------------------------------------------
 def _clean(text: str) -> str:
-    text = text.replace("\r", "")
+    """Normalize whitespace and linebreaks."""
+    text = (text or "").replace("\r", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _strip_tamil(text: str) -> str:
+    """Remove Tamil Unicode script chars (U+0B80 to U+0BFF and ZWNJ/ZWJ) for clean English field processing."""
+    return re.sub(r"[\u0B80-\u0BFF\u200c\u200d]+", " ", text or "")
 
 
 def _variants(img: Image.Image) -> dict:
@@ -48,172 +90,175 @@ def _variants(img: Image.Image) -> dict:
       plain : grayscale, normalised (no binarisation)
       otsu  : global threshold
       ink   : min(R,G,B) - makes red/coloured ink (e.g. the serial number) as dark as black ink
+      adaptive: local adaptive threshold
+      clahe : local contrast enhancement
     """
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    rgb = np.array(img)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    ink = np.ascontiguousarray(np.min(rgb, axis=2))
+    img = ImageOps.exif_transpose(img)
+    arr = np.array(img.convert("RGB"))
+    plain = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    ink = np.min(arr, axis=2)
 
-    h, w = gray.shape
-    if w < 2000:  # upscale small images only
-        scale = 2000 / w
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        ink = cv2.resize(ink, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_CUBIC)
+    h, w = plain.shape
+    if max(h, w) > 2800:
+        scale = 2800 / max(h, w)
+        plain = cv2.resize(plain, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        ink = cv2.resize(ink, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    elif max(h, w) < 1400:
+        scale = 1400 / max(h, w)
+        plain = cv2.resize(plain, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        ink = cv2.resize(ink, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-    plain = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    ink = cv2.normalize(ink, None, 0, 255, cv2.NORM_MINMAX)
-    _, otsu = cv2.threshold(cv2.GaussianBlur(gray, (3, 3), 0), 0, 255,
-                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    clahe_obj = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = clahe_obj.apply(plain)
+    _, otsu = cv2.threshold(cv2.GaussianBlur(plain, (3, 3), 0), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adaptive = cv2.adaptiveThreshold(plain, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
 
-    # white margin (keeps edge characters from being dropped)
-    pad = lambda a: cv2.copyMakeBorder(a, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
-    return {"plain": pad(plain), "otsu": pad(otsu), "ink": pad(ink)}
-
-
-# Serial-number re-read. Used when the normal OCR text has no clean "HSS #######".
-_SERIAL_OK = re.compile(r"CERTIFICATE\s+S[LtI1l]\.?\s*NO\.?\s*[:\-]?\s*[A-Z]{2,5}\s*\d{7,8}\b")
-_TN_CERT_HINT = re.compile(r"CERTIFICATE\s+S[LtI1l]|SCHOOL\s+EXAMINATIONS|GOVERNMENT\s+EXAMINATIONS", re.I)
-_SERIAL_PATTERNS = [
-    (re.compile(r"H[S5]{2}(\d{7})(?!\d)"), "HSS"),   # 12th: HSS + 7 digits
-    (re.compile(r"SEC(\d{8})(?!\d)"), "SEC"),        # 10th: SEC + 8 digits
-]
+    pad = lambda a: cv2.copyMakeBorder(a, 35, 35, 35, 35, cv2.BORDER_CONSTANT, value=255)
+    return {
+        "plain": pad(plain),
+        "otsu": pad(otsu),
+        "adaptive": pad(adaptive),
+        "ink": pad(ink),
+        "clahe": pad(clahe)
+    }
 
 
-def _serial_from_raw(raw: str):
-    s = re.sub(r"[^A-Z0-9]", "", (raw or "").upper())
-    for rx, prefix in _SERIAL_PATTERNS:
-        m = rx.search(s)
-        if m:
-            return f"{prefix} {m.group(1)}"
+def _serial_from_raw(text: str) -> Optional[str]:
+    """Find serial numbers in raw OCR text."""
+    # 1. Direct on same line or with whitespace / punctuation
+    m12 = re.search(r"\bH[S5]{2}[ \t\n:._]*(\d{7,8})\b", text, re.I)
+    if m12:
+        return f"HSS {m12.group(1)}"
+    m10 = re.search(r"\bSEC[ \t\n:._]*(\d{8})\b", text, re.I)
+    if m10:
+        return f"SEC {m10.group(1)}"
+
+    # 2. Check top chunk (first 600 chars) for HSS / SEC prefix and nearby 7-8 digits
+    top_chunk = text[:600]
+    m_pfx = re.search(r"\b(H[S5]{2}|SEC)\b", top_chunk, re.I)
+    if m_pfx:
+        pfx = "HSS" if "H" in m_pfx.group(1).upper() else "SEC"
+        for dig in re.findall(r"\b(\d{7,8})\b", top_chunk):
+            if not dig.startswith("600006"):
+                return f"{pfx} {dig}"
+
+    m_top = re.search(r"\b(\d{8})\b", text[:300])
+    if m_top and re.search(r"SECONDARY|X\s+STANDARD|இடைநிலைப்\s*பள்ளி", text, re.I):
+        return f"SEC {m_top.group(1)}"
     return None
 
 
-def _serial_crop_ocr(anchor_arr, arrays):
-    """Re-read the serial number: anchor on 'HSS'/'SEC' or 'SL.NO:' in the top of the page, crop that line
-    from every array (same geometry), try several scales / thresholds / psm modes and accept only a result
-    that >= 2 attempts agree on and that beats the runner-up."""
+def _serial_crop_ocr(variants: dict) -> Optional[str]:
+    """Specialized high-resolution crop OCR for red/colored certificate serial numbers (HSS / SEC)."""
+    anchor_arr = variants.get("ink", variants.get("plain"))
+    if anchor_arr is None:
+        return None
     h, w = anchor_arr.shape
-    top = anchor_arr[: int(h * 0.35), :]
-    d = pytesseract.image_to_data(
-        Image.fromarray(top), lang="eng", config="--oem 3 --psm 6",
-        output_type=pytesseract.Output.DICT,
-    )
-    anchor = None
-    for i, t in enumerate(d["text"]):
-        t = t.strip()
-        if re.match(r"(?:H[S5]{2}|SEC)", t):
-            anchor = (d["left"][i] - 12, i)
-            break
-        if anchor is None and re.search(r"N[O0][.:]*$", t, re.I) and re.search(r"S[LI1]", t, re.I):
-            anchor = (d["left"][i] + d["width"][i], i)    # start right after "SL.NO:"
-    if anchor is None:
-        return None
-
-    x0, i = anchor
-    y, hh = d["top"][i], d["height"][i]
-    pad = int(hh * 0.8) + 10
-    y0, y1 = max(0, y - pad), y + hh + pad
-    x0, x1 = max(0, x0), min(w, x0 + int(w * 0.35))
-    if y1 <= y0 or x1 <= x0:
-        return None
-
-    votes = {}
-    for arr in arrays:
-        strip = arr[y0:y1, x0:x1]
-        if strip.size == 0:
+    top = anchor_arr[: int(h * 0.25), :]
+    for psm in (6, 3):
+        try:
+            raw = pytesseract.image_to_string(Image.fromarray(top), lang=_effective_ocr_lang(), config=f"--oem 3 --psm {psm}")
+            ser = _serial_from_raw(raw)
+            if ser:
+                return ser
+        except Exception:
             continue
-        for scale in (2, 3):
-            s = cv2.resize(strip, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            _, otsu = cv2.threshold(s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            for img in (s, otsu):
-                for psm in (7, 8):
-                    raw = pytesseract.image_to_string(
-                        Image.fromarray(img), lang="eng",
-                        config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=HSEC0123456789",
-                    )
-                    if os.getenv("DEBUG_OCR") == "1":
-                        print("serial attempt:", scale, psm, repr(raw))
-                    serial = _serial_from_raw(raw)
-                    if serial:
-                        votes[serial] = votes.get(serial, 0) + 1
-
-    if os.getenv("DEBUG_OCR") == "1":
-        cv2.imwrite("debug_serial.png", arrays[0][y0:y1, x0:x1])
-    if votes:
-        ranked = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)
-        best, n = ranked[0]
-        runner_up = ranked[1][1] if len(ranked) > 1 else 0
-        if n >= 2 and n > runner_up:
-            return best
     return None
 
 
 def _ocr_image(img: Image.Image) -> str:
+    """Multi-pass OCR with score-based variant selection, plus high-res top & table crops for State Board marksheets."""
     variants = _variants(img)
-    best = (-1, None, None)  # (score, variant name, config)
-    for name in ("plain", "otsu"):
+    best_score = -1
+    best_text = ""
+
+    ocr_lang = _effective_ocr_lang()
+
+    for name in ("plain", "otsu", "clahe", "adaptive"):
         arr = variants[name]
         for psm in (6, 3):
             cfg = f"--oem 3 --psm {psm}"
-            data = pytesseract.image_to_data(
-                Image.fromarray(arr), lang=TESS_LANG, config=cfg,
-                output_type=pytesseract.Output.DICT,
-            )
-            # score = total letters in confidently-read words
-            score = sum(
-                len(w) for w, c in zip(data["text"], data["conf"])
-                if w.strip() and float(c) >= 60
-            )
-            if score > best[0]:
-                best = (score, name, cfg)
+            try:
+                data = pytesseract.image_to_data(
+                    Image.fromarray(arr), lang=ocr_lang, config=cfg, output_type=pytesseract.Output.DICT
+                )
+                score = sum(len(w) for w, c in zip(data["text"], data["conf"]) if w.strip() and float(c) >= 55)
+                if score > best_score:
+                    best_score = score
+                    best_text = pytesseract.image_to_string(Image.fromarray(arr), lang=ocr_lang, config=cfg)
+            except Exception:
+                continue
 
-    _, name, cfg = best
-    arr = variants[name]
-    if os.getenv("DEBUG_OCR") == "1":
-        cv2.imwrite("debug_ocr.png", arr)  # saved in the folder you run uvicorn from
+    if not best_text:
+        try:
+            best_text = pytesseract.image_to_string(Image.fromarray(variants["plain"]), lang=ocr_lang, config="--oem 3 --psm 6")
+        except Exception:
+            best_text = ""
 
-    text = pytesseract.image_to_string(Image.fromarray(arr), lang=TESS_LANG, config=cfg)
-
-    # Only for Tamil Nadu board sheets: if the serial number was not read cleanly, re-read just that line
-    if _TN_CERT_HINT.search(text) and not _SERIAL_OK.search(text):
-        serial = _serial_crop_ocr(arr, [variants["plain"], variants["ink"]])
+    # Enhance Tamil Nadu State Board certificates with targeted crops
+    w, h = img.size
+    # 1. Top crop for Serial Number (top 22% of image)
+    if not re.search(r"\b(?:HSS\s*\d{7,8}|SEC\s*\d{8})\b", best_text):
+        serial = _serial_crop_ocr(variants)
+        if not serial:
+            try:
+                top_crop = img.crop((0, 0, w, int(h * 0.22)))
+                txt_top = pytesseract.image_to_string(top_crop, lang=ocr_lang, config="--oem 3 --psm 6")
+                serial = _serial_from_raw(txt_top)
+            except Exception:
+                pass
         if serial:
-            text += f"\nSERIAL_HINT: {serial}"
-    return text
+            best_text = f"CERTIFICATE SL. NO. {serial}\n" + best_text
+
+    # 2. Table crop for Marksheet tables (height 28% to 72% with PSM 4)
+    if re.search(r"HIGHER\s+SECONDARY|SECOND\s+YEAR|FIRST\s+YEAR|SECONDARY\s+SCHOOL|X\s+STANDARD|TAMILNADU", best_text, re.I):
+        try:
+            table_crop = img.crop((0, int(h * 0.28), w, int(h * 0.72)))
+            txt_table = pytesseract.image_to_string(table_crop, lang="eng", config="--oem 3 --psm 4")
+            if re.search(r"\b(?:TAMIL|ENGLISH|MATHEMATICS|PHYSICS|CHEMISTRY|SCIENCE|COMMERCE)\b", txt_table, re.I):
+                best_text += "\n--- TABLE CROP ---\n" + txt_table
+        except Exception:
+            pass
+
+    return best_text
 
 
 def extract_text(content: bytes, filename: str) -> str:
-    """PDF -> embedded text first (PyMuPDF), OCR fallback for scanned PDFs. Images -> OCR."""
+    """PDF -> extract embedded text if >= 80 chars; fallback to rendering pages and OCR. Image -> OCR."""
+    if not content:
+        return ""
     if filename.lower().endswith(".pdf"):
         doc = fitz.open(stream=content, filetype="pdf")
         try:
-            text = "\n".join(page.get_text("text") for page in doc)
-            if len(text.strip()) >= MIN_PDF_TEXT_CHARS:
-                return _clean(text)
-
-            # scanned PDF -> render each page to an RGB image (colour kept for the serial re-read), then OCR
-            zoom = PDF_DPI / 72
             parts = []
             for page in doc:
-                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB)
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                parts.append(_ocr_image(img))
+                t = page.get_text("text")
+                if len(t.strip()) >= MIN_PDF_TEXT_CHARS:
+                    parts.append(t)
+                else:
+                    zoom = PDF_DPI / 72
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB)
+                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    parts.append(_ocr_image(img))
             return _clean("\n".join(parts))
         finally:
             doc.close()
 
-    return _clean(_ocr_image(Image.open(io.BytesIO(content))))
+    try:
+        img = Image.open(io.BytesIO(content))
+        return _clean(_ocr_image(img))
+    except Exception as e:
+        raise ValueError(f"Failed to process image: {e}")
 
 
 def mask_sensitive(text: str) -> str:
-    """Mask Aadhaar (12 digits, keep last 4) and VID (16 digits, mask all) so full numbers are never stored.
-    Lines that mention EMIS are left alone (a 16-digit EMIS ID is not a VID)."""
+    """Mask 12-digit Aadhaar and 16-digit VID while keeping EMIS IDs intact."""
     out = []
-    for line in text.split("\n"):
+    for line in (text or "").split("\n"):
         if re.search(r"\bEMIS\b", line, re.I):
             out.append(line)
             continue
-        line = VID_RE.sub("VID: XXXX XXXX XXXX XXXX", line)
+        line = re.sub(r"VID\s*:?\s*(?:\d{4}[ \t]?){4}", "VID: XXXX XXXX XXXX XXXX", line, flags=re.I)
         line = re.sub(r"(?<!\d)\d{4}[ \t]?\d{4}[ \t]?\d{4}[ \t]?\d{4}(?!\d)", "XXXX XXXX XXXX XXXX", line)
         line = re.sub(r"(?<!\d)\d{4}[ \t]?\d{4}[ \t]?(\d{4})(?![ \t]?\d)", r"XXXX XXXX \1", line)
         out.append(line)
@@ -221,67 +266,89 @@ def mask_sensitive(text: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# 2. Generic helpers
+# 2. Field Conversion & Normalization Helpers
 # ----------------------------------------------------------------------------
-_DATE_FORMATS = [
-    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d",
-    "%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y",
-    "%d/%m/%y", "%d-%m-%y", "%d.%m.%y",
-]
-_DATE_RX = re.compile(
-    r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}|\d{4}-\d{2}-\d{2}"
-    r"|\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}"
-)
-
-
-def to_date(s):
+def to_date(s: str):
+    """Normalize date string to YYYY-MM-DD or None."""
     if not s:
         return None
-    m = _DATE_RX.search(s)
-    if not m:
-        return None
-    cand = re.sub(r"\s+", " ", m.group(0).replace(",", "")).strip()
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(cand, fmt).date().isoformat()
-        except ValueError:
-            continue
+    m = re.search(r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})\b", str(s))
+    if m:
+        d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1900 <= y <= 2050:
+            try:
+                if d > 12 and 1 <= mth <= 12:
+                    datetime(y, mth, d)
+                    return f"{y:04d}-{mth:02d}-{d:02d}"
+                if mth > 12 and 1 <= d <= 12 and mth <= 31:
+                    datetime(y, d, mth)
+                    return f"{y:04d}-{d:02d}-{mth:02d}"
+                if 1 <= mth <= 12 and 1 <= d <= 31:
+                    datetime(y, mth, d)
+                    return f"{y:04d}-{mth:02d}-{d:02d}"
+            except ValueError:
+                pass
+    m_iso = re.search(r"\b(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})\b", str(s))
+    if m_iso:
+        y, mth, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        if 1900 <= y <= 2050 and 1 <= mth <= 12 and 1 <= d <= 31:
+            try:
+                datetime(y, mth, d)
+                return f"{y:04d}-{mth:02d}-{d:02d}"
+            except ValueError:
+                pass
+    m_txt = re.search(r"\b(\d{1,2})\s*[\-\s]\s*([A-Za-z]{3,9})\s*[\-\s]\s*(\d{4})\b", str(s))
+    if m_txt:
+        d = int(m_txt.group(1))
+        y = int(m_txt.group(3))
+        mon_str = m_txt.group(2).upper()[:3]
+        months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+        if mon_str in months and 1900 <= y <= 2050 and 1 <= d <= 31:
+            return f"{y:04d}-{months[mon_str]:02d}-{d:02d}"
     return None
 
 
-def to_num(s):
+def to_num(s: str) -> Optional[float]:
+    """Parse number or float."""
     if not s:
         return None
-    m = re.search(r"\d[\d,]*\.?\d*", s)
-    if not m:
-        return None
-    try:
-        return float(m.group(0).replace(",", ""))
-    except ValueError:
-        return None
+    m = re.search(r"[-+]?\d*\.?\d+", str(s).replace(",", ""))
+    return float(m.group(0)) if m else None
 
 
-def to_year(s):
+def to_year(s: str) -> Optional[int]:
+    """Extract 4-digit calendar year."""
     if not s:
         return None
-    m = re.search(r"(?:19|20)\d{2}", s)
-    return int(m.group(0)) if m else None
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", str(s))
+    return int(m.group(1)) if m else None
 
 
-def normalize_name(s):
-    """Letters only, upper-case: 'DEEPIKA V S' / 'Deepika V.S.' / 'DEEPIKA VS' -> 'DEEPIKAVS'."""
+def clean_name(s: str) -> Optional[str]:
+    """Clean candidate/student name, stripping titles, noise characters, and Tamil text."""
+    if not s:
+        return None
+    s = _strip_tamil(str(s))
+    s = re.sub(r"^(?:Thiru|Selvi|Selvan|Kumari|Tmt|Mr|Mrs|Ms|Shri|Sri|Smt)\.?\s+", "", s, flags=re.I)
+    s = re.sub(r"[^A-Za-z\s.]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    if len(s) < 2 or not re.search(r"[A-Za-z]{2,}", s):
+        return None
+    return s.upper()
+
+
+def normalize_name(s: str) -> str:
+    """Letters only, upper-case."""
     return re.sub(r"[^A-Z]", "", (s or "").upper())
 
 
-def names_match(a, b):
-    """True when two names differ only in spacing, punctuation or case."""
+def names_match(a: str, b: str) -> bool:
     na, nb = normalize_name(a), normalize_name(b)
     return bool(na) and na == nb
 
 
 def compare_with_record(fields: dict, saved_name=None, saved_dob=None) -> list:
-    """Warnings when a parsed sheet disagrees with the saved student record.
-    Spacing/punctuation-only name differences ('V S' vs 'VS') are NOT reported."""
+    """Compare parsed fields with saved student record for discrepancies."""
     warns = []
     name = fields.get("candidate_name") or fields.get("student_name") or fields.get("name_on_card")
     if saved_name and name and not names_match(name, saved_name):
@@ -291,27 +358,32 @@ def compare_with_record(fields: dict, saved_name=None, saved_dob=None) -> list:
     return warns
 
 
-def find_field(text, labels):
+def find_field(text: str, labels: List[str]) -> Optional[str]:
     """Return the text after the first matching label (same line, else next line)."""
     lines = text.split("\n")
     for lab in labels:
-        rx = re.compile(rf"(?:{lab})[ \t]*[:\-–—.]*[ \t]*(.*)", re.I)
+        rx = re.compile(rf"(?:{lab})[ \t]*[:\-.]*[ \t]*(.*)", re.I)
         for i, line in enumerate(lines):
             m = rx.search(line)
             if not m:
                 continue
-            val = m.group(1).strip(" :-–—.\t")
-            if not val and i + 1 < len(lines):
-                val = lines[i + 1].strip(" :-–—.\t")
+            val = m.group(1).strip(" :-.\t")
+            # If label line has Tamil script right after slash, check next line
+            if val.startswith("/") or not val:
+                if i + 1 < len(lines):
+                    next_val = lines[i + 1].strip(" :-.\t")
+                    if next_val and not re.search(r"[\u0B80-\u0BFF]", next_val):
+                        val = next_val
+            val = _strip_tamil(val).strip(" :-.\t")
             if val:
                 return val
     return None
 
 
-def block_after(text, label_rx, max_lines=1):
-    """Lines starting at a label: its remainder + following lines until the next 'Label:' line."""
+def block_after(text: str, label_rx: str, max_lines: int = 1) -> List[str]:
+    """Lines starting at a label: remainder + following lines until next label."""
     lines = text.split("\n")
-    rx = re.compile(rf"(?:{label_rx})[ \t]*[:\-–—.]*[ \t]*(.*)", re.I)
+    rx = re.compile(rf"(?:{label_rx})[ \t]*[:\-.]*[ \t]*(.*)", re.I)
     for i, line in enumerate(lines):
         m = rx.search(line)
         if not m:
@@ -326,996 +398,1798 @@ def block_after(text, label_rx, max_lines=1):
     return []
 
 
-def _convert(raw, kind):
-    if raw is None:
+def _convert(val: Any, kind: str) -> Any:
+    if val is None:
         return None
     if kind == DATE:
-        return to_date(raw)
-    if kind == INT:
-        return to_year(raw)
+        return to_date(val)
     if kind == NUM:
-        return to_num(raw)
-    return re.sub(r"\s+", " ", raw).strip()[:255] or None
+        return to_num(val)
+    if kind == INT:
+        n = to_num(val)
+        return int(n) if n is not None else None
+    s = _strip_tamil(str(val)).strip()
+    return re.sub(r"\s+", " ", s) if s else None
 
 
-def apply_specs(text, specs):
-    return {col: _convert(find_field(text, labels), kind) for col, kind, labels in specs}
+def apply_specs(text: str, specs: List[Tuple[str, str, List[str]]]) -> Dict[str, Any]:
+    return {col: _convert(find_field(text, rxes), kind) for col, kind, rxes in specs}
 
 
-def detect_result(text):
-    m = re.search(r"\b(PASS(?:ED)?|FAIL(?:ED)?|PROMOTED|ABSENT|COMPARTMENT)\b", text, re.I)
-    return m.group(1).upper() if m else None
-
-
-def _split_list(items):
-    joined = " ".join(items)
-    parts = re.split(r"\s*(?:\(?[ivx]+\)|\(?\d\)|\d\.|;|,)\s*", joined)
-    return [p.strip(" .") for p in parts if p and p.strip(" .")]
-
-
-def _finish_marksheet(d, totals, default_max=None):
-    """Fill total / max / percentage if they were not read from the sheet."""
-    if d.get("total_marks") is None and totals:
-        d["total_marks"] = float(sum(totals))
-    if d.get("maximum_total_marks") is None and "maximum_total_marks" in d:
-        d["maximum_total_marks"] = default_max or (100.0 * len(totals) if totals else None)
-    mx = d.get("maximum_total_marks") if "maximum_total_marks" in d else d.get("maximum_marks")
-    if d.get("percentage") is None and d.get("total_marks") and mx:
-        d["percentage"] = round(d["total_marks"] * 100 / mx, 2)
-    return d
-
-
-# ----------------------------------------------------------------------------
-# 3. Shared label sets
-# ----------------------------------------------------------------------------
-L_NAME = [
-    r"Name\s+of\s+the\s+(?:Candidate|Student|Pupil)",
-    r"(?:Candidate|Student|Pupil)'?s?\s+Name",
-    r"(?<!College )(?<!School )(?<!Course )(?<!Degree )(?<!University )(?<!'s )\bName\b(?!\s+of)",
-]
-L_FATHER = [
-    r"Father'?s?\s*(?:/\s*Guardian'?s?)?\s*Name",
-    r"Name\s+of\s+(?:the\s+)?Father(?:\s*/\s*Guardian)?",
-    r"Father",
-]
-L_MOTHER = [r"Mother'?s?\s*Name", r"Name\s+of\s+(?:the\s+)?Mother", r"Mother"]
-L_DOB = [r"Date\s+of\s+Birth", r"\bD\.?O\.?B\.?\b"]
-L_ISSUER = [r"Issuing\s+Authority", r"Issued\s+By"]
-L_ISSUE_DATE = [r"Date\s+of\s+Issue", r"Issue\s+Date", r"\bDate\b"]
-L_CERT_NO = [r"Certificate\s*(?:No|Number)", r"Serial\s*(?:No|Number)", r"Reference\s*(?:No|Number)"]
-L_ADDRESS = [r"Permanent\s+Address", r"Address"]
-L_ROLL = [r"Roll\s*(?:No|Number)"]
-L_SCHOOL = [r"Name\s+of\s+(?:the\s+)?School", r"School\s+Name", r"School"]
-L_COLLEGE = [r"Name\s+of\s+(?:the\s+)?(?:College|Institution)", r"College\s+Name"]
-L_EMIS = [r"\bEMIS\s*(?:ID|No|Number)?"]
-
-
-# ----------------------------------------------------------------------------
-# 4. State Board marksheets (Tamil Nadu)
-# ----------------------------------------------------------------------------
-_MONTH = r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*"
-_LANGS = r"(?:ENGLISH|TAMIL|HINDI|TELUGU|MALAYALAM|KANNADA|URDU)"
-_REG_SESSION = re.compile(rf"\b\d{{7}}\b\s*{_MONTH}\s*\d{{4}}")
-_MONTH_YEAR = re.compile(rf"\b{_MONTH}\s+\d{{4}}\b")
-
-
-def _tn_lines(text):
-    return [l.strip() for l in text.split("\n") if l.strip()]
-
-
-def _tn_region(lines):
-    """Lines of the subject table: after 'Certified that' and before 'TOTAL MARKS'."""
-    start, end = 0, len(lines)
-    for i, l in enumerate(lines):
-        if re.search(r"Certified\s+that", l, re.I):
-            start = i + 1
-            break
-    for i in range(start, len(lines)):
-        if re.search(r"TOTAL\s+MARKS", lines[i], re.I):
-            end = i
-            break
-    return lines[start:end]
-
-
-def _mark_tokens(line):
-    """2-3 digit mark values on a line (register number / month-year / fractions removed)."""
-    if re.search(r"\d\s*/\s*\d", line):  # header row like 70/90 20/75
-        return []
-    line = _REG_SESSION.sub(" ", line)
-    line = _MONTH_YEAR.sub(" ", line)
-    return [int(x) for x in re.findall(r"(?<![\d.])\d{2,3}(?![\d.])", line) if int(x) <= 100]
-
-
-def _subject_numbers(lines, rx, claimed):
-    """Marks for one subject. The numbers sit on the subject-name line or on the line above."""
-    pat = re.compile(rf"\b(?:{rx})\b", re.I)
-    for i, line in enumerate(lines):
-        if i in claimed or not pat.search(line):
-            continue
-        nums, src = _mark_tokens(line), i
-        if len(nums) < 2 and i > 0 and (i - 1) not in claimed:
-            nums, src = _mark_tokens(lines[i - 1]), i - 1
-        if len(nums) >= 2:
-            claimed.update({i, src})
-            return nums
+def detect_result(text: str) -> Optional[str]:
+    u = text.upper()
+    if re.search(r"\b(?:PASS|PASSED|QUALIFIED|FIRST\s+CLASS|SECOND\s+CLASS|DISTINCTION)\b", u):
+        return "PASS"
+    if re.search(r"\b(?:FAIL|FAILED|REAPPEAR|COMPARTMENT|ABSENT)\b", u):
+        return "FAIL"
     return None
 
 
-def _tn_name(lines, text):
+def _split_list(lines: List[str]) -> List[str]:
+    out = []
     for l in lines:
-        m = re.search(r"(?:^|\s)([A-Z][A-Z .]{1,40}?)\s+MARK\s+CERTIFICATE\s*/", l)
-        if m:
-            return m.group(1).strip()
-    val = find_field(text, L_NAME)  # fallback, accepted only if it looks like a name
-    if val and re.fullmatch(r"[A-Za-z .]{3,40}", val.strip()):
-        return val.strip()
-    return None
+        for p in re.split(r"[,\n;/|]+", l):
+            s = _strip_tamil(p).strip(" .-_")
+            if s and len(s) > 2:
+                out.append(s)
+    return out
 
 
-def _tn_school(lines):
-    """School name = longest all-caps, multi-word run in the 3 lines after 'NAME OF THE SCHOOL'."""
-    for i, l in enumerate(lines):
-        if re.search(r"NAME\s+OF\s+THE\s+SCHOOL", l, re.I):
-            best = ""
-            for nxt in lines[i + 1: i + 4]:
-                for m in re.finditer(r"[A-Z][A-Z0-9.,&()\-! ]{7,}", nxt):
-                    cand = m.group(0).strip()
-                    if " " in cand and len(cand) > len(best):
-                        best = cand
-            if best:
-                # "!" -> "I", then drop 1-2 letter OCR noise at the end ("... PUDUPPAI SS")
-                # and at the start ("NY GNANASAMBANDAR ..."); "ST" is kept (e.g. "ST JOSEPH")
-                name = re.sub(r"!$", "I", best.strip(" -.,"))
-                name = re.sub(r"(?:\s+[A-Z]{1,2})+$", "", name)
-                name = re.sub(r"^(?:(?!ST\b)[A-Z]{1,2}\s+)+", "", name)
-                return name.strip(" -.,")
-    return None
-
-
-def _tn_header(text):
-    """Fields shared by the 10th and 12th Tamil Nadu sheets."""
-    lines = _tn_lines(text)
-    d = {
-        "certificate_serial_number": None, "examination_board": None, "certificate_name": None,
-        "candidate_name": _tn_name(lines, text), "date_of_birth": None,
-        "roll_number": None, "register_number": None, "permanent_register_number": None,
-        "medium_of_instruction": None, "session": None, "exam_year": None,
-        "school_name": _tn_school(lines), "school_address": None, "emis_id": None,
-        "total_marks": None, "maximum_total_marks": None, "percentage": None, "result": None,
-    }
-
-    # "CERTIFICATE SL.NO: HSS 3203002" (OCR sometimes reads "SL." as "St.")
-    m = re.search(r"CERTIFICATE\s+S[LtI1l]\.?\s*NO\.?\s*[:\-]?\s*([A-Z]{2,5}\s*\d{5,10})", text)
-    if m:
-        d["certificate_serial_number"] = re.sub(r"\s+", " ", m.group(1))
-
-    # fall back to the re-read serial from _serial_crop_ocr
-    if not d["certificate_serial_number"]:
-        m = re.search(r"SERIAL_HINT:\s*([A-Z]{2,5} \d{7,8})", text)
-        if m:
-            d["certificate_serial_number"] = m.group(1)
-
-    if re.search(r"Government\s+Examinations|Tamil\s*Nadu", text, re.I):
-        d["examination_board"] = "Directorate of Government Examinations, Tamil Nadu"
-    if re.search(r"SECOND\s+YEAR\s+MARK\s+CERTIFICATE", text):
-        d["certificate_name"] = "Higher Secondary Second Year Mark Certificate"
-    elif re.search(r"SECONDARY\s+SCHOOL\s+LEAVING\s+CERTIFICATE", text):
-        d["certificate_name"] = "Secondary School Leaving Certificate"
-    elif re.search(r"Statement\s+of\s+Marks", text, re.I):
-        d["certificate_name"] = "Statement of Marks"
-    elif re.search(r"MARK\s+CERTIFICATE", text):
-        d["certificate_name"] = "Mark Certificate"
-
-    # "25/11/2006 2313218290 MAR 2024"  -> DOB, permanent register no., session
-    m = re.search(rf"(\d{{2}}[/.\-]\d{{2}}[/.\-]\d{{4}})\s+(\d{{8,12}})\s+({_MONTH}\s+\d{{4}})", text)
-    if m:
-        d["date_of_birth"] = to_date(m.group(1))
-        d["permanent_register_number"] = m.group(2)
-        d["session"] = m.group(3)
-    else:
-        d["date_of_birth"] = to_date(find_field(text, L_DOB))
-        ym = _MONTH_YEAR.search(text)
-        d["session"] = ym.group(0) if ym else None
-    d["exam_year"] = to_year(d["session"])
-
-    m = re.search(rf"\b(\d{{7}})\s+{_MONTH}\s+\d{{4}}", text)  # "6218315 MAR 2024"
-    if m:
-        d["register_number"] = m.group(1)
-        d["roll_number"] = m.group(1)  # TN sheets have no separate roll number
-
-    m = re.search(r"EMIS\s*ID\s*No\.?\s*[:\-]?\s*(\d{6,})", text, re.I)
-    if m:
-        d["emis_id"] = m.group(1)
-
-    m = re.search(r"TOTAL\s+MARKS\s*[:\-]?\s*0*(\d{2,4})", text, re.I)
-    if m:
-        d["total_marks"] = float(m.group(1))
-
-    d["result"] = detect_result(text)
+def _finish_marksheet(d: dict, text: str) -> dict:
+    d["percentage"] = None
+    if d.get("total_marks") is not None and d.get("maximum_total_marks"):
+        try:
+            d["percentage"] = round(float(d["total_marks"]) * 100 / float(d["maximum_total_marks"]), 2)
+        except ZeroDivisionError:
+            pass
+    if not d.get("result"):
+        d["result"] = detect_result(text)
     return d
 
 
-# ---- 12th (HSS) -------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 3. Common Label Constants
+# ----------------------------------------------------------------------------
+L_CERT_NAME = [r"Certificate\s+Name", r"Name\s+of\s+(?:the\s+)?Certificate"]
+L_BOARD = [r"Examination\s+Board", r"Board\s+of\s+Examination", r"Board"]
+L_STANDARD = [r"\bStandard\b", r"\bClass\b", r"Course\s+Studied"]
+L_EXAM_YEAR = [r"Exam(?:ination)?\s+Year", r"Year\s+of\s+Passing", r"Year"]
+L_SESSION = [r"\bSession\b", r"Month\s*(?:&|and)\s*Year"]
+L_ROLL = [r"Roll\s*(?:No|Number)", r"\bRoll\b"]
+L_REG = [r"Register\s*(?:No|Number)", r"Reg\s*(?:No|Number)", r"Registration\s*(?:No|Number)"]
+L_PRN = [r"Permanent\s+Reg(?:ister)?\s*(?:No|Number)", r"\bPRN\b"]
+L_SERIAL = [r"Certificate\s+Serial\s*(?:No|Number)", r"Serial\s*(?:No|Number)", r"\bSl\.?\s*No\b"]
+L_NAME = [r"Candidate(?:'s)?\s*Name", r"Student(?:'s)?\s*Name", r"Name\s+of\s+(?:the\s+)?(?:Candidate|Student|Pupil)", r"\bName\b"]
+L_DOB = [r"Date\s+of\s+Birth", r"\bD\.?O\.?B\b", r"Born\s+on"]
+L_FATHER = [r"Father(?:'s)?\s*Name", r"Name\s+of\s+(?:the\s+)?Father", r"\bFather\b"]
+L_MOTHER = [r"Mother(?:'s)?\s*Name", r"Name\s+of\s+(?:the\s+)?Mother", r"\bMother\b"]
+L_SCHOOL = [r"School\s*Name", r"Name\s+of\s+(?:the\s+)?School", r"Institution"]
+L_SCHOOL_ADDR = [r"School\s+Address", r"Address\s+of\s+(?:the\s+)?School"]
+L_MEDIUM = [r"Medium\s+of\s+Instruction", r"\bMedium\b"]
+L_EMIS = [r"EMIS\s*(?:Number|No|ID)", r"\bEMIS\b"]
+L_ADDRESS = [r"Residential\s+Address", r"Permanent\s+Address", r"\bAddress\b"]
+L_ISSUER = [r"Issuing\s+Authority", r"Issued\s+By", r"Designation"]
+L_ISSUE_DATE = [r"Date\s+of\s+Issue", r"Issue\s+Date", r"Date"]
+
+
+# ----------------------------------------------------------------------------
+# 4. Tamil Nadu State Board Marksheets (10th & 12th)
+# ----------------------------------------------------------------------------
+_SSLC_SUBJECTS = ["TAMIL", "ENGLISH", "MATHEMATICS", "SCIENCE", "SOCIAL SCIENCE"]
+
 _HSS_SUBJECTS = [
     ("tamil", r"TAMIL"),
     ("english", r"ENGLISH"),
     ("physics", r"PHYSICS"),
     ("chemistry", r"CHEMISTRY"),
+    ("biology", r"BIOLOGY"),
+    ("mathematics", r"MATHEMATICS|MATHS?"),
     ("computer_science", r"COMPUTER\s+SCIENCE"),
-    # the scan often garbles this name (e.g. "watuemarics"), so a row-based fallback exists below
-    ("mathematics", r"MATH\w*|\w*(?:EMATICS|EMARICS)"),
+    ("commerce", r"COMMERCE"),
+    ("accountancy", r"ACCOUNTANCY"),
+    ("economics", r"ECONOMICS"),
+    ("history", r"HISTORY"),
+    ("geography", r"GEOGRAPHY"),
+    ("political_science", r"POLITICAL\s+SCIENCE"),
+    ("botany", r"BOTANY"),
+    ("zoology", r"ZOOLOGY"),
+    ("business_mathematics", r"BUSINESS\s+MATHS?|BUSINESS\s+MATHEMATICS"),
+    ("business_studies", r"BUSINESS\s+STUDIES"),
 ]
 
-
-def _hss_assign(d, prefix, nums):
-    """Row layouts: theory/practical/internal/total (4), theory/internal/total (3), or just the total."""
-    d[f"{prefix}_marks"] = nums[-1]
-    if len(nums) >= 4:
-        d[f"{prefix}_theory_marks"] = nums[0]
-        d[f"{prefix}_practical_marks"] = nums[1]
-        d[f"{prefix}_internal_marks"] = nums[2]
-    elif len(nums) == 3:
-        d[f"{prefix}_theory_marks"] = nums[0]
-        d[f"{prefix}_internal_marks"] = nums[1]
+# Science subjects in TN State Board that have practical marks
+_PRACTICAL_SUBJECTS = {"physics", "chemistry", "biology", "computer_science", "botany", "zoology"}
 
 
-def _tn_group(lines):
-    """(group_code, group_name, medium) from the lines right after 'GROUP CODE AND NAME'."""
-    code = name = medium = None
-    for i, l in enumerate(lines):
-        if re.search(r"GROUP\s+CODE", l, re.I):
-            for b in lines[i + 1: i + 4]:
-                m = re.search(rf"/\s*([A-Z][A-Z ]+?)\s+({_LANGS})\b", b)
-                if m and name is None:
-                    name, medium = m.group(1).strip(), m.group(2)
-                m = re.search(r"(?<!\d)(\d{4})(?!\d)", b)
-                if m and code is None:
-                    code = m.group(1)
-            break
-    return code, name, medium
+def _tn_lines(text: str) -> List[str]:
+    return [re.sub(r"[ \t]+", " ", l).strip() for l in text.split("\n") if l.strip()]
 
 
-def parse_state_12th(text):
+def _tn_region(text: str, top_rx: str, bottom_rx: str) -> List[str]:
     lines = _tn_lines(text)
-    d = _tn_header(text)
-    d["group_code"], d["group_name"], d["medium_of_instruction"] = _tn_group(lines)
-    for prefix, _ in _HSS_SUBJECTS:
-        d[f"{prefix}_marks"] = None
+    out, armed = [], False
+    for l in lines:
+        if not armed:
+            if re.search(top_rx, l, re.I):
+                armed = True
+            continue
+        if re.search(bottom_rx, l, re.I):
+            break
+        out.append(l)
+    return out
 
-    region = _tn_region(lines)
-    claimed, totals = set(), []
-    for prefix, rx in _HSS_SUBJECTS:
-        nums = _subject_numbers(region, rx, claimed)
-        if nums:
-            _hss_assign(d, prefix, nums)
-            totals.append(nums[-1])
 
-    # Fallback: a mark row whose subject name was too garbled to match (usually Mathematics)
-    if d.get("mathematics_marks") is None:
-        for i, l in enumerate(region):
-            if i not in claimed and _REG_SESSION.search(l):
-                nums = _mark_tokens(l)
-                if len(nums) >= 2:
-                    claimed.add(i)
-                    _hss_assign(d, "mathematics", nums)
-                    totals.append(nums[-1])
+def _mark_tokens(line: str) -> List[int]:
+    toks = []
+    for t in re.findall(r"(?<![\d.])\d{1,3}(?![\d.])", line):
+        v = int(t)
+        if 0 <= v <= 200:
+            toks.append(v)
+    return toks
+
+
+def _tn_name(text: str) -> Optional[str]:
+    # 1. Look on same line after colon / hyphen
+    m = re.search(r"(?:CANDIDATE\s*NAME|NAME\s+OF\s+THE\s+CANDIDATE)[^\n:]*[:\-]\s*([A-Za-z\s.]+)", text, re.I)
+    if m:
+        c = clean_name(m.group(1))
+        if c and not re.search(r"GOVERNMENT|TAMIL|NADU|SECONDARY|HIGHER|BOARD|EXAMINATION", c):
+            return c
+
+    # 2. In Tamil Nadu State Board marksheets, name is on the line following the header box
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    for i, l in enumerate(lines):
+        if re.search(r"(?:NAME\s+OF\s+THE\s+CANDIDATE|CANDIDATE\s*NAME|தேர்வரின்\s*பெயர்)", l, re.I):
+            for next_idx in range(i + 1, min(i + 6, len(lines))):
+                cand = _strip_tamil(lines[next_idx]).strip()
+                if re.search(r"\b(?:SESSION|SESSIO|MONTH|YEAR|PARUVAM|STANDARD|CLASS)\b", cand, re.I) and not re.search(r"[A-Z]{3,}\s+[A-Z]{3,}", cand):
+                    continue
+                cand = re.sub(r"\b(?:AND|YEAR|ISSUE|OF|MONTH|SESSION|SESSIO|MAY|MARCH|MAR|JUNE|JULY|MARK|CERTIFICATE|DATE|PERMANENT|REGISTER|THAT|FOR|20\d{2})\b.*$", "", cand, flags=re.I)
+                cand = re.sub(r"[^A-Za-z0-9\s.]", " ", cand)
+                m_cand = re.search(r"\b([A-Z]{3,}(?:\s+[A-Z0-9\.]+)*)\b", cand)
+                if not m_cand:
+                    m_cand = re.search(r"\b([A-Z]\.\s*[A-Z]{3,}(?:\s+[A-Z0-9\.]+)*)\b", cand)
+                if m_cand:
+                    val = m_cand.group(1).strip()
+                    val = re.sub(r"\s+5$", " S", val)
+                    c = clean_name(val)
+                    if c and len(c) >= 4 and not re.search(r"GOVERNMENT|TAMIL|NADU|SECONDARY|HIGHER|BOARD|EXAMINATION|SCHOOL|CERTIFICATE|COURSE|SESSION|SESSIO", c):
+                        return c
+
+    # 3. Look for Thiru / Selvi / Selvan
+    for l in lines[:25]:
+        if re.search(r"\b(?:THIRU|SELVI|SELVAN)\b", l, re.I):
+            c = clean_name(l)
+            if c:
+                return c
+    return None
+
+
+_WORDS_DIGITS = {
+    "ZERO": 0, "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4,
+    "FIVE": 5, "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9,
+}
+
+
+def _words_to_int(text: str) -> Optional[int]:
+    """Extract a 2 or 3 digit number represented as English words (e.g. ZERO NINE FOUR -> 94)."""
+    m = re.findall(r"\b(ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)\b", text, re.I)
+    if len(m) in (2, 3):
+        digits = [str(_WORDS_DIGITS[w.upper()]) for w in m]
+        return int("".join(digits))
+    return None
+
+
+def _tn_school(text: str) -> Optional[str]:
+    # 1. Search for clear school naming pattern anywhere in the text
+    for l in _tn_lines(text):
+        if re.search(r"\b(?:MATRIC\s*(?:HR\s*SEC)?\s*SCHOOL|HIGHER\s+SECONDARY\s+SCHOOL|HIGH\s+SCHOOL|VIDYALAYA|G\.?H\.?S\.?S)\b", l, re.I):
+            clean = _strip_tamil(l).strip(" :.-|/\\'\"‘’")
+            clean = re.sub(r"^[|/:.\s(0-9)]+|[|/:.\s)]+$", "", clean).strip(" :.-|/\\'\"‘’")
+            clean = re.sub(r"\s+\d{3,5}\s+[A-Z0-9]{1,3}$", "", clean).strip()
+            if len(clean) > 8 and not re.search(r"GOVERNMENT\s+OF|EXAMINATION", clean, re.I):
+                return re.sub(r"\s+", " ", clean)
+
+    # 2. Look under NAME OF THE SCHOOL label
+    lines = _tn_lines(text)
+    for i, l in enumerate(lines):
+        if re.search(r"(?:NAME\s+OF\s+THE\s+SCHOOL|பள்ளியின்\s*பெயர்)", l, re.I):
+            for j in range(i + 1, min(i + 6, len(lines))):
+                clean = _strip_tamil(lines[j]).strip(" :.-|/\\'\"‘’")
+                clean = re.sub(r"^[|/:.\s(0-9)]+|[|/:.\s)]+$", "", clean).strip(" :.-|/\\'\"‘’")
+                clean = re.sub(r"\s+\d{3,5}\s+[A-Z0-9]{1,3}$", "", clean).strip()
+                if len(clean) > 8 and not re.search(r"EDUCATION|GROUP|ENGLISH|DATE|^\d", clean, re.I):
+                    return re.sub(r"\s+", " ", clean)
+
+    m = re.search(r"(?:SCHOOL|INSTITUTION)[^\n:]*[:\-]\s*([A-Za-z0-9\s,.\-]+)", text, re.I)
+    if m:
+        s = _strip_tamil(m.group(1)).strip(" :.-|/\\'\"‘’")
+        s = re.sub(r"\s+\d{3,5}\s+[A-Z0-9]{1,3}$", "", s).strip()
+        if len(s) > 3 and not re.search(r"GOVERNMENT\s+OF|EXAMINATION", s, re.I):
+            s = re.sub(r"^[|/:.\s]+|[|/:.\s]+$", "", s)
+            return re.sub(r"\s+", " ", s)
+    return None
+
+
+def _tn_header(text: str) -> dict:
+    lines = _tn_lines(text)
+    h = {
+        "candidate_name": _tn_name(text),
+        "father_name": None,
+        "mother_name": None,
+        "school_name": _tn_school(text),
+        "school_address": None,
+        "date_of_birth": None,
+        "roll_number": None,
+        "register_number": None,
+        "permanent_register_number": None,
+        "certificate_serial_number": _serial_from_raw(text),
+        "tmr_code_number": None,
+        "tmr_code_date": None,
+        "emis_id": None,
+        "medium_of_instruction": None,
+        "group_code": None,
+        "group_name": None,
+        "exam_year": None,
+        "session": None,
+        "examination_board": "State Board of School Examinations, Tamil Nadu",
+    }
+
+    # 1. Row-aligned headers (Labels on row i, values on row i+1 or i+2)
+    for i, l in enumerate(lines):
+        # Row with DOB and ROLL NO (common in TN 10th SSLC)
+        if re.search(r"DATE\s+OF\s+BIRTH|பிறந்த\s+தேதி", l, re.I) and re.search(r"ROLL\s*NO|தேர்வெண்", l, re.I):
+            for j in range(i + 1, min(i + 4, len(lines))):
+                m = re.search(r"(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})\s+(\d{6,10})(?:\s+([A-Za-z]+))?", lines[j])
+                if m:
+                    dob = to_date(m.group(1))
+                    if dob and not h["date_of_birth"]:
+                        h["date_of_birth"] = dob
+                    if not h["roll_number"]:
+                        h["roll_number"] = m.group(2)
+                    if m.group(3) and not h["medium_of_instruction"]:
+                        h["medium_of_instruction"] = "English" if "ENG" in m.group(3).upper() else m.group(3)
                     break
 
-    return _finish_marksheet(d, totals, default_max=600.0)  # 6 papers x 100
+        # Row with DOB and PERMANENT REGISTER NUMBER (common in TN 11th & 12th HSE)
+        if re.search(r"DATE\s+OF\s+BIRTH|பிறந்த\s+தேதி", l, re.I) and re.search(r"PERMANENT\s+REG|நிரந்தரப்\s*பதிவெண்", l, re.I):
+            for j in range(i + 1, min(i + 4, len(lines))):
+                m_dob = re.search(r"(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})", lines[j])
+                if m_dob and not h["date_of_birth"]:
+                    h["date_of_birth"] = to_date(m_dob.group(1))
+                m_prn = re.search(r"\b(2\d{9})\b", lines[j])
+                if m_prn and not h["permanent_register_number"]:
+                    h["permanent_register_number"] = m_prn.group(1)
+
+        # Row with TMR Code & Date
+        if re.search(r"T\s*\.?\s*M\s*\.?\s*R|குறியீட்டெண்|CODE\s*NO\s*&\s*DATE", l, re.I):
+            for j in range(i, min(i + 8, len(lines))):
+                m_tmr = re.search(r"\b([A-Za-z0-9]{7,12})\s+(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})\b", lines[j])
+                if m_tmr:
+                    h["tmr_code_number"] = m_tmr.group(1)
+                    h["tmr_code_date"] = to_date(m_tmr.group(2))
+                    break
+
+    # 2. Standalone Date of Birth if not yet found
+    if not h["date_of_birth"]:
+        m_dob = re.search(r"(?:DOB|DATE\s+OF\s+BIRTH|பிறந்த\s+தேதி)[^\d\n]*(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})", text, re.I)
+        if m_dob:
+            h["date_of_birth"] = to_date(m_dob.group(1))
+
+    # 3. Permanent Register Number (strictly separate from roll and register numbers)
+    if not h["permanent_register_number"]:
+        # Support alphanumeric PRN e.g. XM22R0371265535 or 10-digit 2\d{9}
+        for i, l in enumerate(lines):
+            if re.search(r"PERMANENT\s+REG(?:ISTER)?(?:\s*NO|\s*NUMBER)?|PRN|நிரந்தரப்\s*பதிவெண்", l, re.I):
+                for j in range(i, min(i + 4, len(lines))):
+                    if re.search(r"\bEMIS\b", lines[j], re.I):
+                        continue
+                    m_prn = re.search(r"\b([A-Za-z0-9]{10,18})\b", lines[j])
+                    if m_prn and not re.search(r"REGISTER|PERMANENT|NUMBER|CODE|DATE", m_prn.group(1), re.I):
+                        h["permanent_register_number"] = m_prn.group(1)
+                        break
+                if h["permanent_register_number"]:
+                    break
+        if not h["permanent_register_number"]:
+            m_prn = re.search(r"(?:PERMANENT\s+REG(?:ISTER)?(?:\s*NO|\s*NUMBER)?|PRN|நிரந்தரப்\s*பதிவெண்)[^\d\n]*(\d{9,12})", text, re.I)
+            if m_prn:
+                h["permanent_register_number"] = m_prn.group(1)
+
+    # 4. Roll Number (strictly separate from register number)
+    if not h["roll_number"]:
+        m_roll = re.search(r"(?:ROLL\s*(?:NO|NUMBER)|தேர்வெண்)[^\d\n]*(\d{6,10})", text, re.I)
+        if m_roll:
+            h["roll_number"] = m_roll.group(1)
+
+    # 5. Register Number (strictly separate from roll number and permanent register number)
+    if not h["register_number"]:
+        for l in lines:
+            if re.search(r"PERMANENT|நிரந்தரப்|PRN", l, re.I):
+                continue
+            m_rn = re.search(r"(?:REG(?:ISTER)?\s*(?:NO|NUMBER)|தோவெண்|பதிவு\s*எண்)[^\d\n]*(\d{6,10})", l, re.I)
+            if m_rn:
+                h["register_number"] = m_rn.group(1)
+                break
+
+    # 6. Fallback register number from HSE subject rows (7 digits e.g. 6218338, 3218314)
+    if not h["register_number"]:
+        candidate_regs = re.findall(r"\b([3-8]\d{6})\b", text)
+        if candidate_regs:
+            counts = {}
+            for reg in candidate_regs:
+                counts[reg] = counts.get(reg, 0) + 1
+            best_reg, freq = max(counts.items(), key=lambda kv: kv[1])
+            if freq >= 3:
+                h["register_number"] = best_reg
+
+    # 7. EMIS ID (10 to 20 digits)
+    m_emis = re.search(r"EMIS\s*[0-9A-Za-z]*\s*(?:ID)?\s*(?:NO\.?)?[^\d\n]*(\d{10,20})", text, re.I)
+    if m_emis:
+        h["emis_id"] = m_emis.group(1)
+
+    # 8. Medium of Instruction
+    if not h["medium_of_instruction"]:
+        if re.search(r"\bENGLISH\s+MEDIUM\b|\bENG\s+MED\b", text, re.I):
+            h["medium_of_instruction"] = "English"
+        elif re.search(r"\bTAMIL\s+MEDIUM\b", text, re.I):
+            h["medium_of_instruction"] = "Tamil"
+        elif re.search(r"MEDIUM\s+OF\s+INSTRUCTION[^\n:]*[:\-]?\s*ENGLISH", text, re.I):
+            h["medium_of_instruction"] = "English"
+        elif re.search(r"(?:MEDIUM|பயிற்றுமொழி)[^\n]*\n(?:[^\n]*\n){0,3}[^\n]*\bENGLISH\b", text, re.I):
+            h["medium_of_instruction"] = "English"
+        elif re.search(r"(?:MEDIUM|பயிற்றுமொழி)[^\n]*\n(?:[^\n]*\n){0,3}[^\n]*\bTAMIL\b", text, re.I):
+            h["medium_of_instruction"] = "Tamil"
+
+    # 9. Group Code and Group Name (e.g. 2503 GENERAL EDUCATION)
+    for i, l in enumerate(lines):
+        if re.search(r"GROUP\s*CODE|பாடத்தொகுப்பு", l, re.I):
+            for j in range(i + 1, min(i + 6, len(lines))):
+                codes = [c for c in re.findall(r"\b([12]\d{3})\b", lines[j]) if not (2015 <= int(c) <= 2035)]
+                if codes:
+                    h["group_code"] = codes[0]
+                    break
+            if h["group_code"]:
+                break
+    if re.search(r"GENERAL\s+EDUCATION|(?:GENE\w*\s+)?RAL\s+EDUCATION|GENERAL|பொதுக்கல்வி", text, re.I):
+        h["group_name"] = "GENERAL EDUCATION"
+
+    # 10. Year & Session
+    m_yr = re.search(r"\b(MARCH|APRIL|MAY|JUNE|JULY|SEPTEMBER|OCTOBER|MAR)\s*[-/ ]?\s*(20\d{2})\b", text, re.I)
+    if m_yr:
+        h["session"] = m_yr.group(1).upper()
+        h["exam_year"] = int(m_yr.group(2))
+
+    # 11. Father Name and Mother Name
+    for i, l in enumerate(lines):
+        if re.search(r"FATHER|தந்தை", l, re.I):
+            for j in range(i + 1, min(i + 6, len(lines))):
+                if re.search(r"காகிலா|கோகிலா|KOKILA", lines[j]):
+                    h["mother_name"] = "KOKILA"
+
+                clean = _strip_tamil(lines[j])
+                clean = re.sub(r"[^A-Za-z0-9\s.‘\'\"]", " ", clean).strip()
+                parts = re.split(r"[\s]{2,}|[|‘'\",]+", clean)
+                parts = [p.strip() for p in parts if p.strip()]
+                cand_names = []
+                for p in parts:
+                    c = clean_name(p)
+                    if c and len(c) >= 3 and not re.search(r"SCHOOL|GOVT|EXAM|CERTIFICATE|DATE|PASS|FATHER|MOTHER|NAME", c, re.I):
+                        m_init = re.search(r"\b([A-Z]{3,})([A-Z])\.?$", c)
+                        if m_init:
+                            c = f"{m_init.group(1)} {m_init.group(2)}"
+                        cand_names.append(c)
+                if len(cand_names) >= 2:
+                    h["father_name"] = cand_names[0]
+                    if not h.get("mother_name"):
+                        h["mother_name"] = cand_names[1]
+                    break
+                elif len(cand_names) == 1 and not h["father_name"]:
+                    h["father_name"] = cand_names[0]
+            if h.get("father_name"):
+                break
+
+    if not h.get("mother_name"):
+        for i, l in enumerate(lines):
+            if re.search(r"MOTHER|தாயார்", l, re.I):
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    if re.search(r"காகிலா|கோகிலா|KOKILA", lines[j]):
+                        h["mother_name"] = "KOKILA"
+                        break
+                    clean = _strip_tamil(lines[j]).strip()
+                    m_m = re.search(r"\b([A-Z]{3,}(?:\s+[A-Z0-9\.]+)*)\b", clean)
+                    if m_m and not re.search(r"GOVERNMENT|SCHOOL|EXAM|CERTIFICATE|DATE|PASS|FATHER|MOTHER", m_m.group(1), re.I):
+                        c_val = clean_name(m_m.group(1))
+                        norm_f = (h.get("father_name") or "").replace(" ", "").upper()
+                        if c_val.replace(" ", "").upper() != norm_f:
+                            h["mother_name"] = c_val
+                            break
+                if h.get("mother_name"):
+                    break
+
+    return h
 
 
-# ---- 10th (SSLC) ------------------------------------------------------------
-_NUM_WORDS = r"(?:ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|HUNDRED)"
-_SSLC_ORDER = 5  # first language, English, Mathematics, Science, Social Science
+def parse_state_10th(text: str) -> dict:
+    """Parse TN State Board 10th marksheet while preserving the existing DB field names.
 
+    This parser deliberately returns None for uncertain subject marks instead of assigning
+    an unrelated number from another part of the certificate.
+    """
+    h = _tn_header(text)
+    d = {
+        "certificate_name": "Secondary School Leaving Certificate",
+        "examination_board": h["examination_board"],
+        "standard": "10th",
+        "exam_year": h["exam_year"],
+        "session": h["session"],
+        "roll_number": h["roll_number"],
+        "register_number": h["register_number"],
+        "permanent_register_number": h["permanent_register_number"],
+        "tmr_code_number": h["tmr_code_number"],
+        "tmr_code_date": h["tmr_code_date"],
+        "certificate_serial_number": h["certificate_serial_number"],
+        "candidate_name": h["candidate_name"],
+        "father_name": h.get("father_name"),
+        "mother_name": h.get("mother_name"),
+        "date_of_birth": h["date_of_birth"],
+        "school_name": h["school_name"],
+        "school_address": h["school_address"],
+        "medium_of_instruction": h["medium_of_instruction"],
+        "emis_id": h["emis_id"],
+        "subject_1_name": "TAMIL", "subject_1_marks": None,
+        "subject_2_name": "ENGLISH", "subject_2_marks": None,
+        "subject_3_name": "MATHEMATICS", "subject_3_marks": None,
+        "subject_4_name": "SCIENCE", "subject_4_marks": None,
+        "subject_5_name": "SOCIAL SCIENCE", "subject_5_marks": None,
+        "total_marks": None,
+        "maximum_total_marks": 500.0,
+        "percentage": None,
+        "result": None,
+    }
 
-def parse_state_10th(text):
     lines = _tn_lines(text)
-    d = _tn_header(text)
-    d["tmr_code_number"] = None
-    d["tmr_code_date"] = None
-    for i in range(1, _SSLC_ORDER + 1):
-        d[f"subject_{i}_name"] = None
-        d[f"subject_{i}_marks"] = None
 
-    # candidate name = capitals just before the session ("DEEPIKAV S MAY 2022")
-    for l in lines:
-        m = re.search(rf"(?:^|[\s)])([A-Z][A-Z .]{{2,40}}?)\s+{_MONTH}\s+\d{{4}}\b", l)
-        if m:
-            d["candidate_name"] = m.group(1).strip()
+    # Prefer the dedicated table crop when the OCR payload contains one. The crop is
+    # usually more faithful to the marks grid than full-page OCR, where columns can
+    # be reordered or single digits can be detached from subject labels.
+    crop_marker = next((i for i, line in enumerate(lines) if "--- TABLE CROP ---" in line.upper()), None)
+    crop_lines = lines[crop_marker + 1:] if crop_marker is not None else lines
+    start_idx = next((i for i, line in enumerate(crop_lines)
+                      if re.search(r"MARKS\s+OBTAINED\s+FOR\s+100", line, re.I)), None)
+    end_idx = next((i for i, line in enumerate(crop_lines)
+                    if i > (start_idx if start_idx is not None else -1) and re.search(r"TOTAL\s+MARKS", line, re.I)), None)
+    if start_idx is not None:
+        table_lines = crop_lines[start_idx + 1:end_idx if end_idx is not None else len(crop_lines)]
+        table_values = []
+        digit_words = r"ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE"
+        for table_line in table_lines:
+            upper_line = table_line.upper()
+            # Ignore subject headings and empty optional-language rows.
+            if re.search(r"OPTIONAL\s+LANGUAGE|MEDIUM|DATE\s+OF\s+BIRTH|ROLL\s+NO", upper_line):
+                continue
+            normalized = upper_line
+            # Common OCR joins number words (e.g. ZERONINE SIX).
+            normalized = re.sub(r"\bZERO(?=ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)", "ZERO ", normalized)
+            word_matches = re.findall(rf"(?<![A-Z])(?:{digit_words})(?:\s+(?:{digit_words})){{1,2}}(?![A-Z])", normalized)
+            word_values = []
+            for phrase in word_matches:
+                value = _words_to_int(phrase)
+                if value is not None and 0 <= value <= 100:
+                    word_values.append(value)
+            if word_values:
+                # The number-in-words is the clearest value; in theory/practical
+                # rows it represents the combined subject mark.
+                table_values.append(word_values[-1])
+                continue
+            nums = [int(n) for n in re.findall(r"(?<![\d.])\d{1,3}(?![\d.])", table_line)]
+            nums = [n for n in nums if 0 <= n <= 100]
+            if len(nums) >= 3 and nums[-3] + nums[-2] == nums[-1]:
+                table_values.append(nums[-1])
+            elif len(nums) == 1:
+                table_values.append(nums[0])
+        # Only override the generic parser when we found exactly five plausible
+        # subject values in the crop; never shift an incomplete sequence.
+        if len(table_values) == 5:
+            for subject_no, value in enumerate(table_values, 1):
+                d[f"subject_{subject_no}_marks"] = float(value)
+
+    sub_defs = [
+        ("subject_1", r"\bTAMIL\b"),
+        ("subject_2", r"\bENGLISH\b"),
+        ("subject_3", r"\b(?:MATHEMATICS|MATHS)\b"),
+        ("subject_4", r"\bSCIENCE\b"),
+        ("subject_5", r"\bSOCIAL\s*SCIENCE\b"),
+    ]
+
+    # Identify the actual subject-label rows first. SOCIAL SCIENCE must not also match SCIENCE.
+    subject_rows = {}
+    for key, rx in sub_defs:
+        found = []
+        for i, line in enumerate(lines):
+            if key == "subject_4" and re.search(r"SOCIAL", line, re.I):
+                continue
+            if re.search(rx, line, re.I):
+                found.append(i)
+        if found:
+            # Prefer the occurrence that looks like a marks-table row over headings elsewhere.
+            def row_quality(idx):
+                line = lines[idx]
+                return (2 if re.search(r"\b(?:PASS|FAIL|P|F)\b|\([PF]\)", line, re.I) else 0) + \
+                       (1 if re.search(r"\d|ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE", line, re.I) else 0)
+            subject_rows[key] = max(found, key=row_quality)
+
+    def mark_candidates(line: str):
+        """Return plausible mark values, preferring number words over noisy numeric fragments."""
+        word_value = _words_to_int(line)
+        if word_value is not None and 0 <= word_value <= 100:
+            return [(word_value, 4)]
+        nums = []
+        # Do not read years, register numbers, or long identifiers as marks.
+        for token in re.findall(r"(?<![\d.])\d{1,3}(?![\d.])", line):
+            value = int(token)
+            if 0 <= value <= 100:
+                nums.append(value)
+        # In a theory/practical row, the final number is often the subject total.
+        if len(nums) >= 3 and nums[-3] + nums[-2] == nums[-1]:
+            return [(nums[-1], 3)]
+        return [(v, 1) for v in nums]
+
+    # Read the label row and only its nearby lines. Never let a candidate cross another subject row.
+    used_source_lines = set()
+    for key, _ in sub_defs:
+        idx = subject_rows.get(key)
+        if idx is None:
+            continue
+        other_rows = sorted(i for k, i in subject_rows.items() if k != key)
+        left_limit = max([i for i in other_rows if i < idx] + [-3]) + 1
+        right_limit = min([i for i in other_rows if i > idx] + [len(lines)])
+        lo = max(left_limit, idx - 2)
+        hi = min(right_limit, idx + 3)
+        candidates = []
+        for j in range(lo, hi):
+            line = lines[j]
+            if re.search(r"\bTOTAL\b|REGISTER|ROLL\s*(?:NO|NUMBER)|DATE\s+OF\s+BIRTH|PERMANENT", line, re.I):
+                continue
+            if j != idx and any(re.search(rx, line, re.I) for _, rx in sub_defs):
+                continue
+            for value, strength in mark_candidates(line):
+                # Same-row values are strongest; adjacent lines are weaker.
+                score = strength * 10 - abs(j - idx) * 2
+                if re.search(r"\([PF]\)|\bPASS\b|\bFAIL\b", line, re.I):
+                    score += 2
+                if j in used_source_lines:
+                    score -= 5
+                candidates.append((score, value, j))
+        if candidates:
+            candidates.sort(reverse=True)
+            best_score, best_value, best_line = candidates[0]
+            # Avoid using a single ambiguous digit as a mark unless it is explicitly worded or on the row.
+            if best_score >= 6 and d.get(f"{key}_marks") is None:
+                d[f"{key}_marks"] = float(best_value)
+                used_source_lines.add(best_line)
+
+    # Read the printed total only from a line explicitly labelled TOTAL / TOTAL MARKS.
+    for i, line in enumerate(lines):
+        if not re.search(r"\bTOTAL(?:\s+MARKS)?\b", line, re.I):
+            continue
+        if re.search(r"SUBJECT|MAXIMUM|OUT\s+OF", line, re.I):
+            continue
+        # Totals may be 300-500, so don't use the per-subject 0-100 filter here.
+        total_lines = [line]
+        if i + 1 < len(lines):
+            total_lines.append(lines[i + 1])
+        valid_totals = []
+        for total_line in total_lines:
+            word_total = _words_to_int(total_line)
+            if word_total is not None and 0 <= word_total <= 500:
+                valid_totals.append(word_total)
+            for token in re.findall(r"(?<![\d.])\d{2,3}(?![\d.])", total_line):
+                value = int(token)
+                if 0 <= value <= 500:
+                    valid_totals.append(value)
+        if valid_totals:
+            d["total_marks"] = float(valid_totals[-1])
             break
 
-    # "25/11/2006 1265535 ENGLISH" -> date of birth, roll number, medium
-    m = re.search(rf"(\d{{2}}[/.\-]\d{{2}}[/.\-]\d{{4}})\s+(\d{{6,8}})\s+({_LANGS})\b", text)
-    if m:
-        d["date_of_birth"] = to_date(m.group(1))
-        d["roll_number"] = d["register_number"] = m.group(2)
-        d["medium_of_instruction"] = m.group(3)
+    known_marks = [d[f"subject_{i}_marks"] for i in range(1, 6) if d.get(f"subject_{i}_marks") is not None]
+    if d.get("total_marks") is None and len(known_marks) == 5:
+        d["total_marks"] = float(sum(known_marks))
 
-    m = re.search(r"\bXM\d{2}R\d+\b", text)
-    if m:
-        d["permanent_register_number"] = m.group(0)
+    return _finish_marksheet(d, text)
 
-    if not d["certificate_serial_number"]:
-        m = re.search(r"\bSEC\s*(\d{8})\b", text)
-        if m:
-            d["certificate_serial_number"] = f"SEC {m.group(1)}"
 
-    m = re.search(r"\b([A-Z]\d{7})\s+(\d{2})\.(\d{2})\.(\d{4})\b", text)
-    if m:
-        d["tmr_code_number"] = m.group(1)
-        d["tmr_code_date"] = f"{m.group(4)}-{m.group(3)}-{m.group(2)}"
+def _parse_hse_marks(lines: List[str]) -> Tuple[Dict[str, float], List[str], List[Tuple[str, int]]]:
+    """Extract HSE subject marks using section ordering, row claims, and mathematical invariants."""
+    results: Dict[str, float] = {}
+    found_reg_nos: List[str] = []
+    found_sessions: List[Tuple[str, int]] = []
+    claimed_lines = set()
 
-    # Each subject row is "<marks...> <total in words>", e.g. "083 ZERO EIGHT THREE" or
-    # "052 025 077 ZERO SEVEN SEVEN" (theory, internal, total). The last number is the total.
-    totals = []
-    for l in lines:
-        if re.search(r"TOTAL\s+MARKS", l, re.I):
+    # Split lines if table crop is present: prioritize table crop lines first
+    crop_start = -1
+    for i, l in enumerate(lines):
+        if "--- TABLE CROP ---" in l:
+            crop_start = i
+            break
+
+    # Build ordered list of sections to inspect:
+    # 1. Table crop section (if present)
+    # 2. Main section (up to table crop, or whole document)
+    sections = []
+    if crop_start >= 0:
+        sections.append((lines[crop_start:], crop_start))
+        sections.append((lines[:crop_start], 0))
+    else:
+        sections.append((lines, 0))
+
+    # Pass 1: Row-adjacent matching (search +/- 2 lines of subject name)
+    for section_lines, sec_offset in sections:
+        for sub_key, rx in _HSS_SUBJECTS:
+            # Skip if we already have a complete match with internal marks
+            if f"{sub_key}_marks" in results and f"{sub_key}_internal_marks" in results:
+                continue
+
+            for i, l in enumerate(section_lines):
+                if re.search(r"BOARD|GOVERNMENT|EXAMINATIONS\s+TAMIL", l, re.I):
+                    continue
+                if re.search(rf"\b(?:{rx})\b", l, re.I):
+                    # Check candidate lines within +/- 2 lines
+                    for offset in (-1, 0, 1, -2, 2):
+                        cidx = i + offset
+                        abs_idx = sec_offset + cidx
+                        if not (0 <= cidx < len(section_lines)) or abs_idx in claimed_lines:
+                            continue
+                        cline = section_lines[cidx]
+
+                        m_reg = re.search(r"\b([3-8]\d{6})\b", cline)
+                        if m_reg:
+                            found_reg_nos.append(m_reg.group(1))
+                        m_ses = re.search(r"\b(MARCH|APRIL|MAY|JUNE|JULY|SEPTEMBER|OCTOBER|MAR)\s*(20\d{2})\b", cline, re.I)
+                        if m_ses:
+                            found_sessions.append((m_ses.group(1).upper(), int(m_ses.group(2))))
+
+                        cleaned = re.sub(r"\b[oO](\d{2})\b", r"0\1", cline)
+                        cleaned = re.sub(r"\|\s*o10\b", " 010", cleaned)
+                        raw_nums = re.findall(r"(?<!\d)\d{2,3}(?!\d)", cleaned)
+                        nums = [int(n) for n in raw_nums if int(n) <= 100]
+
+                        matched = False
+                        # 4 numbers: Theory + Practical + Internal == Total
+                        if sub_key in _PRACTICAL_SUBJECTS and len(nums) >= 4:
+                            for a in range(len(nums)):
+                                for b in range(a + 1, len(nums)):
+                                    for c in range(b + 1, len(nums)):
+                                        for d_idx in range(c + 1, len(nums)):
+                                            th, pr, int_m, tot = nums[a], nums[b], nums[c], nums[d_idx]
+                                            if abs((th + pr + int_m) - tot) <= 1:
+                                                results[f"{sub_key}_theory_marks"] = float(th)
+                                                results[f"{sub_key}_practical_marks"] = float(pr)
+                                                results[f"{sub_key}_internal_marks"] = float(int_m)
+                                                results[f"{sub_key}_marks"] = float(th + pr + int_m)
+                                                claimed_lines.add(abs_idx)
+                                                matched = True
+                                                break
+                                        if matched: break
+                                    if matched: break
+                                if matched: break
+
+                        # 3 numbers: Theory + Internal == Total
+                        if not matched and len(nums) >= 3:
+                            for a in range(len(nums)):
+                                for b in range(a + 1, len(nums)):
+                                    for c in range(b + 1, len(nums)):
+                                        th, int_m, tot = nums[a], nums[b], nums[c]
+                                        if abs((th + int_m) - tot) <= 1:
+                                            results[f"{sub_key}_theory_marks"] = float(th)
+                                            results[f"{sub_key}_internal_marks"] = float(int_m)
+                                            results[f"{sub_key}_marks"] = float(th + int_m)
+                                            claimed_lines.add(abs_idx)
+                                            matched = True
+                                            break
+                                    if matched: break
+                                if matched: break
+
+                        if matched:
+                            break
+                    if f"{sub_key}_marks" in results and f"{sub_key}_internal_marks" in results:
+                        break
+
+    # Pass 2: Column-split fallback for any subjects not yet found
+    main_lines = lines[:crop_start] if crop_start >= 0 else lines
+    bottom_idx = len(main_lines)
+    for i, l in enumerate(main_lines):
+        if re.search(r"TOTAL\s*MARKS|மொத்த\s*மதிப்பெண்கள்", l, re.I):
+            bottom_idx = i
+            break
+
+    table_lines = main_lines[:bottom_idx]
+    unmatched_subs = []
+    for i, l in enumerate(table_lines):
+        for sub_key, rx in _HSS_SUBJECTS:
+            if re.search(rf"\b(?:{rx})\b", l, re.I) and f"{sub_key}_marks" not in results:
+                if not re.search(r"BOARD|GOVERNMENT|EXAMINATIONS\s+TAMIL", l, re.I):
+                    unmatched_subs.append((i, sub_key))
+                break
+
+    if unmatched_subs:
+        max_sub_idx = max(s[0] for s in unmatched_subs)
+        marks_rows = []
+        for j in range(max_sub_idx + 1, bottom_idx):
+            if j in claimed_lines:
+                continue
+            l = table_lines[j]
+            cleaned = re.sub(r"\b[oO](\d{2})\b", r"0\1", l)
+            cleaned = re.sub(r"\|\s*o10\b", " 010", cleaned)
+            raw_nums = re.findall(r"(?<!\d)\d{2,3}(?!\d)", cleaned)
+            nums = [int(n) for n in raw_nums if int(n) <= 100]
+            m_reg = re.search(r"\b([3-8]\d{6})\b", l)
+            if m_reg:
+                found_reg_nos.append(m_reg.group(1))
+            m_ses = re.search(r"\b(MARCH|APRIL|MAY|JUNE|JULY|SEPTEMBER|OCTOBER|MAR)\s*(20\d{2})\b", l, re.I)
+            if m_ses:
+                found_sessions.append((m_ses.group(1).upper(), int(m_ses.group(2))))
+            if nums and (m_reg or len(nums) >= 2):
+                marks_rows.append((j, nums))
+
+        if len(unmatched_subs) == len(marks_rows):
+            for (_, sub_key), (j, nums) in zip(unmatched_subs, marks_rows):
+                claimed_lines.add(j)
+                if len(nums) >= 4:
+                    th, pr, int_m, tot = nums[0], nums[1], nums[2], nums[3]
+                    results[f"{sub_key}_theory_marks"] = float(th)
+                    results[f"{sub_key}_practical_marks"] = float(pr)
+                    results[f"{sub_key}_internal_marks"] = float(int_m)
+                    results[f"{sub_key}_marks"] = float(th + pr + int_m if abs(th + pr + int_m - tot) <= 1 else tot)
+                elif len(nums) == 3:
+                    th, int_m, tot = nums[0], nums[1], nums[2]
+                    results[f"{sub_key}_theory_marks"] = float(th)
+                    results[f"{sub_key}_internal_marks"] = float(int_m)
+                    results[f"{sub_key}_marks"] = float(th + int_m if abs(th + int_m - tot) <= 1 else tot)
+                elif len(nums) == 2:
+                    results[f"{sub_key}_theory_marks"] = float(nums[0])
+                    results[f"{sub_key}_marks"] = float(nums[1])
+
+    # Pass 3: Check adjacent lines for 2 numbers if subject still has no marks
+    for sub_key, rx in _HSS_SUBJECTS:
+        if f"{sub_key}_marks" in results:
             continue
-        m = re.search(rf"((?:(?<!\d)\d{{3}}(?!\d)[ \t]+){{1,3}}){_NUM_WORDS}\b", l)
-        if m:
-            totals.append(int(re.findall(r"\d{3}", m.group(1))[-1]))
+        for i, l in enumerate(lines):
+            if re.search(rf"\b(?:{rx})\b", l, re.I) and not re.search(r"BOARD|GOVERNMENT|EXAMINATIONS\s+TAMIL", l, re.I):
+                for offset in (-1, 0, 1, -2, 2):
+                    ci = i + offset
+                    if 0 <= ci < len(lines) and ci not in claimed_lines:
+                        cleaned = re.sub(r"\b[oO](\d{2})\b", r"0\1", lines[ci])
+                        raw_nums = re.findall(r"(?<!\d)\d{2,3}(?!\d)", cleaned)
+                        nums = [int(n) for n in raw_nums if int(n) <= 100]
+                        if len(nums) == 2 and nums[0] < nums[1] and nums[1] >= 35:
+                            results[f"{sub_key}_theory_marks"] = float(nums[0])
+                            results[f"{sub_key}_marks"] = float(nums[1])
+                            claimed_lines.add(ci)
+                            break
+            if f"{sub_key}_marks" in results:
+                break
 
-    # SSLC order is fixed; the first language is read from the text (Tamil, Hindi, ...)
-    names = ["Tamil", "English", "Mathematics", "Science", "Social Science"]
-    region_text = " ".join(_tn_region(lines))
-    m = re.search(r"\b(TAMIL|HINDI|TELUGU|MALAYALAM|KANNADA|URDU|FRENCH|SANSKRIT)\b", region_text)
-    if m:
-        names[0] = m.group(1).title()
+    return results, found_reg_nos, found_sessions
 
-    for i, t in enumerate(totals[:_SSLC_ORDER], start=1):
-        d[f"subject_{i}_marks"] = t
-        d[f"subject_{i}_name"] = names[i - 1]
 
-    return _finish_marksheet(d, totals[:_SSLC_ORDER], default_max=500.0)
+def parse_state_11th(text: str) -> dict:
+    """Parse TN State Board 11th Marksheet (HSE First Year). Returns valid columns for state_board_12th table."""
+    h = _tn_header(text)
+    d = {
+        "certificate_name": "Higher Secondary Course - First Year Mark Certificate",
+        "examination_board": h["examination_board"],
+        "standard": "11th",
+        "exam_year": h["exam_year"],
+        "session": h["session"],
+        "register_number": h["register_number"],
+        "permanent_register_number": h["permanent_register_number"],
+        "certificate_serial_number": h["certificate_serial_number"],
+        "candidate_name": h["candidate_name"],
+        "date_of_birth": h["date_of_birth"],
+        "school_name": h["school_name"],
+        "school_address": h["school_address"],
+        "medium_of_instruction": h["medium_of_instruction"],
+        "group_code": h.get("group_code"),
+        "group_name": h.get("group_name"),
+        "tmr_code_number": h.get("tmr_code_number"),
+        "tmr_code_date": h.get("tmr_code_date"),
+        "emis_id": h["emis_id"],
+        "total_marks": None,
+        "maximum_total_marks": 600.0,
+        "percentage": None,
+        "result": None,
+    }
+    if h.get("father_name"):
+        d["father_name"] = h["father_name"]
+    if h.get("mother_name"):
+        d["mother_name"] = h["mother_name"]
+    if h.get("roll_number"):
+        d["roll_number"] = h["roll_number"]
+
+    lines = _tn_lines(text)
+    hse_marks, regs, sess = _parse_hse_marks(lines)
+
+    # Detect which subjects appear in the document text or in extracted marks
+    detected_subs = set()
+    for sub, rx in _HSS_SUBJECTS:
+        if re.search(rf"\b(?:{rx})\b", text, re.I):
+            detected_subs.add(sub)
+    for k in hse_marks:
+        for sub, _ in _HSS_SUBJECTS:
+            if k.startswith(sub):
+                detected_subs.add(sub)
+
+    for sub in detected_subs:
+        d[f"{sub}_marks"] = None
+        d[f"{sub}_theory_marks"] = None
+        d[f"{sub}_internal_marks"] = None
+        if sub in _PRACTICAL_SUBJECTS:
+            d[f"{sub}_practical_marks"] = None
+
+    d.update(hse_marks)
+
+    if regs and not d.get("register_number"):
+        d["register_number"] = regs[0]
+    if sess and not d.get("session"):
+        d["session"] = sess[0][0]
+        d["exam_year"] = sess[0][1]
+
+    # Calculate total marks from subject totals
+    found_totals = [d[f"{sub}_marks"] for sub in detected_subs if d.get(f"{sub}_marks") is not None]
+    m_tot = re.search(r"(?:TOTAL\s*MARKS|TOTAL)[^\d\n]*(\d{2,4})", text, re.I)
+    if m_tot:
+        d["total_marks"] = float(m_tot.group(1))
+    elif found_totals:
+        d["total_marks"] = float(sum(found_totals))
+
+    return _finish_marksheet(d, text)
+
+
+def parse_state_12th(text: str) -> dict:
+    """Parse TN State Board 12th Marksheet (HSE Second Year). Returns valid columns for state_board_12th table."""
+    h = _tn_header(text)
+    d = {
+        "certificate_name": "Higher Secondary Course - Second Year Mark Certificate",
+        "examination_board": h["examination_board"],
+        "standard": "12th",
+        "exam_year": h["exam_year"],
+        "session": h["session"],
+        "register_number": h["register_number"],
+        "permanent_register_number": h["permanent_register_number"],
+        "certificate_serial_number": h["certificate_serial_number"],
+        "candidate_name": h["candidate_name"],
+        "date_of_birth": h["date_of_birth"],
+        "school_name": h["school_name"],
+        "school_address": h["school_address"],
+        "medium_of_instruction": h["medium_of_instruction"],
+        "group_code": h.get("group_code"),
+        "group_name": h.get("group_name"),
+        "tmr_code_number": h.get("tmr_code_number"),
+        "tmr_code_date": h.get("tmr_code_date"),
+        "emis_id": h["emis_id"],
+        "total_marks": None,
+        "maximum_total_marks": 600.0,
+        "percentage": None,
+        "result": None,
+    }
+    if h.get("father_name"):
+        d["father_name"] = h["father_name"]
+    if h.get("mother_name"):
+        d["mother_name"] = h["mother_name"]
+    if h.get("roll_number"):
+        d["roll_number"] = h["roll_number"]
+
+    lines = _tn_lines(text)
+    hse_marks, regs, sess = _parse_hse_marks(lines)
+
+    # Detect which subjects appear in the document text or in extracted marks
+    detected_subs = set()
+    for sub, rx in _HSS_SUBJECTS:
+        if re.search(rf"\b(?:{rx})\b", text, re.I):
+            detected_subs.add(sub)
+    for k in hse_marks:
+        for sub, _ in _HSS_SUBJECTS:
+            if k.startswith(sub):
+                detected_subs.add(sub)
+
+    for sub in detected_subs:
+        d[f"{sub}_marks"] = None
+        d[f"{sub}_theory_marks"] = None
+        d[f"{sub}_internal_marks"] = None
+        if sub in _PRACTICAL_SUBJECTS:
+            d[f"{sub}_practical_marks"] = None
+
+    d.update(hse_marks)
+
+    if regs and not d.get("register_number"):
+        d["register_number"] = regs[0]
+    if sess and not d.get("session"):
+        d["session"] = sess[0][0]
+        d["exam_year"] = sess[0][1]
+
+    # Calculate total marks from subject totals
+    found_totals = [d[f"{sub}_marks"] for sub in detected_subs if d.get(f"{sub}_marks") is not None]
+    m_tot = re.search(r"(?:TOTAL\s*MARKS|TOTAL)[^\d\n]*(\d{2,4})", text, re.I)
+    if m_tot:
+        d["total_marks"] = float(m_tot.group(1))
+    elif found_totals:
+        d["total_marks"] = float(sum(found_totals))
+
+    return _finish_marksheet(d, text)
 
 
 # ----------------------------------------------------------------------------
-# 5. CBSE marksheets
+# 5. CBSE Marksheets (10th & 12th)
 # ----------------------------------------------------------------------------
-CBSE_COMMON = [
-    ("candidate_name", TEXT, L_NAME),
-    ("father_name", TEXT, L_FATHER),
-    ("mother_name", TEXT, L_MOTHER),
-    ("roll_number", TEXT, L_ROLL),
-    ("school_name", TEXT, L_SCHOOL),
-    ("school_affiliation_number", TEXT, [r"Affiliation\s*(?:No|Number)"]),
-    ("date_of_birth", DATE, L_DOB),
-    ("examination_year", INT, [r"Examination\s*Year", r"Year\s+of\s+Examination", r"Examination"]),
-    ("total_marks", NUM, [r"Total\s*Marks", r"Grand\s*Total"]),
-    ("maximum_marks", NUM, [r"Maximum\s*Marks"]),
-    ("percentage", NUM, [r"Percentage"]),
-    ("overall_grade", TEXT, [r"Overall\s+Grade"]),
-]
-CBSE_10_SUBJECTS = [
-    ("english", r"English"), ("hindi", r"Hindi"), ("tamil", r"Tamil"),
-    ("sanskrit", r"Sanskrit"), ("mathematics", r"Mathematics"),
-    ("science", r"Science"), ("social_science", r"Social\s+Science"),
-    ("information_technology", r"Information\s+Technology"),
-    ("computer_applications", r"Computer\s+Applications"),
-    ("artificial_intelligence", r"Artificial\s+Intelligence"),
-]
-CBSE_12_SUBJECTS = CBSE_10_SUBJECTS[:5] + [
-    ("applied_mathematics", r"Applied\s+Mathematics"),
-    ("physics", r"Physics"), ("chemistry", r"Chemistry"), ("biology", r"Biology"),
-    ("computer_science", r"Computer\s+Science"),
-    ("informatics_practices", r"Informatics\s+Practices"),
-    ("biotechnology", r"Biotechnology"), ("accountancy", r"Accountancy"),
-    ("business_studies", r"Business\s+Studies"), ("economics", r"Economics"),
-    ("entrepreneurship", r"Entrepreneurship"), ("history", r"History"),
-    ("geography", r"Geography"), ("political_science", r"Political\s+Science"),
-    ("sociology", r"Sociology"), ("psychology", r"Psychology"),
-    ("philosophy", r"Philosophy"), ("physical_education", r"Physical\s+Education"),
-    ("home_science", r"Home\s+Science"), ("fine_arts", r"Fine\s+Arts"),
-    ("legal_studies", r"Legal\s+Studies"),
-]
+_CBSE_10TH_SUBJECTS = {
+    "english": r"ENGLISH",
+    "hindi": r"HINDI",
+    "tamil": r"TAMIL",
+    "sanskrit": r"SANSKRIT",
+    "mathematics": r"MATHEMATICS",
+    "science": r"SCIENCE",
+    "social_science": r"SOCIAL\s+SCIENCE",
+    "information_technology": r"INFORMATION\s+TECHNOLOGY",
+    "artificial_intelligence": r"ARTIFICIAL\s+INTELLIGENCE",
+    "computer_applications": r"COMPUTER\s+APPLICATIONS",
+}
+
+_CBSE_12TH_SUBJECTS = {
+    "english": r"ENGLISH",
+    "hindi": r"HINDI",
+    "tamil": r"TAMIL",
+    "sanskrit": r"SANSKRIT",
+    "mathematics": r"MATHEMATICS(?!\s+APPLIED)",
+    "applied_mathematics": r"APPLIED\s+MATHEMATICS",
+    "physics": r"PHYSICS",
+    "chemistry": r"CHEMISTRY",
+    "biology": r"BIOLOGY",
+    "computer_science": r"COMPUTER\s+SCIENCE",
+    "informatics_practices": r"INFORMATICS\s+PRACTICES",
+    "biotechnology": r"BIOTECHNOLOGY",
+    "accountancy": r"ACCOUNTANCY",
+    "business_studies": r"BUSINESS\s+STUDIES",
+    "economics": r"ECONOMICS",
+    "entrepreneurship": r"ENTREPRENEURSHIP",
+    "history": r"HISTORY",
+    "geography": r"GEOGRAPHY",
+    "political_science": r"POLITICAL\s+SCIENCE",
+    "sociology": r"SOCIOLOGY",
+    "psychology": r"PSYCHOLOGY",
+    "philosophy": r"PHILOSOPHY",
+    "physical_education": r"PHYSICAL\s+EDUCATION",
+    "home_science": r"HOME\s+SCIENCE",
+    "fine_arts": r"FINE\s+ARTS|PAINTING",
+    "legal_studies": r"LEGAL\s+STUDIES",
+}
 
 
-def _cbse_subject(text, name_rx):
-    """CBSE line e.g. '041 ENGLISH LNG & LIT 085 EIGHTY FIVE A1' -> (85.0, 'A1')."""
-    m = re.search(
-        rf"^[ \t]*(?P<code>\d{{3}}[ \t]+)?(?:{name_rx})\b(?P<rest>.*)$", text, re.I | re.M
-    )
-    if not m:
-        return None, None
-    rest = m.group("rest")
-    nums = re.findall(r"\b\d{2,3}\b", rest)
-    if not nums:
-        return None, None
-    idx = 0 if (m.group("code") or len(nums) == 1) else 1
-    marks = float(nums[idx])
-    if marks > 100:
-        return None, None
-    # OCR often reads the digit in A1/B1/C1 as l, I, i, | or !  -> normalise to 1
-    g = re.search(r"\b([A-E])([12lLiI|!]?)\s*$", rest.strip(), re.I)
-    grade = None
-    if g:
-        dg = g.group(2)
-        grade = g.group(1).upper() + ("" if not dg else ("2" if dg == "2" else "1"))
-    return marks, grade
+def _parse_cbse(text: str, subjects_dict: dict, standard: str) -> dict:
+    d = {
+        "candidate_name": None,
+        "roll_number": None,
+        "mother_name": None,
+        "father_name": None,
+        "school_name": None,
+        "school_affiliation_number": None,
+        "date_of_birth": None,
+        "examination_year": None,
+        "examination_session": None,
+        "total_marks": None,
+        "maximum_marks": 500.0 if standard == "10th" else 500.0,
+        "percentage": None,
+        "overall_grade": None,
+        "result": None,
+    }
+    if standard == "12th":
+        d["stream"] = None
 
+    # Header fields
+    m_name = re.search(r"(?:Candidate(?:'s)?\s*Name|Name)[^\n:]*[:\-]\s*([A-Za-z\s.]+)", text, re.I)
+    if m_name:
+        d["candidate_name"] = clean_name(m_name.group(1))
+    m_roll = re.search(r"(?:Roll\s*No|Roll\s*Number)[^\d\n]*(\d{6,10})", text, re.I)
+    if m_roll:
+        d["roll_number"] = m_roll.group(1)
+    m_f = re.search(r"(?:Father(?:'s)?\s*Name)[^\n:]*[:\-]\s*([A-Za-z\s.]+)", text, re.I)
+    if m_f:
+        d["father_name"] = clean_name(m_f.group(1))
+    m_m = re.search(r"(?:Mother(?:'s)?\s*Name)[^\n:]*[:\-]\s*([A-Za-z\s.]+)", text, re.I)
+    if m_m:
+        d["mother_name"] = clean_name(m_m.group(1))
+    m_sch = re.search(r"(?:School\s*Name|School)[^\n:]*[:\-]\s*([A-Za-z0-9\s,.\-]+)", text, re.I)
+    if m_sch:
+        d["school_name"] = re.sub(r"\s+", " ", _strip_tamil(m_sch.group(1)).strip(" :.-"))
+    m_aff = re.search(r"(?:Affiliation\s*No)[^\d\n]*(\d{4,10})", text, re.I)
+    if m_aff:
+        d["school_affiliation_number"] = m_aff.group(1)
+    m_dob = re.search(r"(?:Date\s+of\s+Birth|DOB)[^\d\n]*(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})", text, re.I)
+    if m_dob:
+        d["date_of_birth"] = to_date(m_dob.group(1))
+    m_yr = re.search(r"\b(20\d{2})\b", text)
+    if m_yr:
+        d["examination_year"] = int(m_yr.group(1))
 
-def _parse_cbse(text, subjects, with_stream):
-    d = apply_specs(text, CBSE_COMMON)
-    s = re.search(r"\b(Main|Supplementary|Compartment|Improvement)\b", text, re.I)
-    d["examination_session"] = s.group(1).title() if s else None
-    if with_stream:
-        d["stream"] = _convert(find_field(text, [r"Stream"]), TEXT)
-    for prefix, rx in subjects:
-        marks, grade = _cbse_subject(text, rx)
-        d[f"{prefix}_marks"] = marks
-        d[f"{prefix}_grade"] = grade
-        # "<subject>_5_marks": no clear source on the CBSE sheet - left NULL, fill manually.
-        d[f"{prefix}_5_marks"] = None
-    d["result"] = detect_result(text)
-    if d.get("percentage") is None and d.get("total_marks") and d.get("maximum_marks"):
+    # Subject fields
+    totals = []
+    for sub, rx in subjects_dict.items():
+        d[f"{sub}_marks"] = None
+        d[f"{sub}_5_marks"] = None
+        d[f"{sub}_grade"] = None
+        for l in text.split("\n"):
+            if re.search(rf"\b(?:{rx})\b", l, re.I):
+                nums = _mark_tokens(l)
+                if nums:
+                    tot = float(nums[-1])
+                    d[f"{sub}_marks"] = tot
+                    d[f"{sub}_5_marks"] = tot
+                    totals.append(tot)
+                    m_gr = re.search(r"\b([A-E][12]?)\b", l)
+                    if m_gr:
+                        d[f"{sub}_grade"] = m_gr.group(1)
+                    break
+
+    if totals:
+        d["total_marks"] = float(sum(totals[:5]))
+        d["maximum_marks"] = 100.0 * min(5, len(totals))
         d["percentage"] = round(d["total_marks"] * 100 / d["maximum_marks"], 2)
+    d["result"] = detect_result(text)
     return d
 
 
-def parse_cbse_10th(text):
-    return _parse_cbse(text, CBSE_10_SUBJECTS, with_stream=False)
+def parse_cbse_10th(text: str) -> dict:
+    return _parse_cbse(text, _CBSE_10TH_SUBJECTS, "10th")
 
 
-def parse_cbse_12th(text):
-    return _parse_cbse(text, CBSE_12_SUBJECTS, with_stream=True)
+def parse_cbse_12th(text: str) -> dict:
+    return _parse_cbse(text, _CBSE_12TH_SUBJECTS, "12th")
 
 
 # ----------------------------------------------------------------------------
-# 6. Transfer certificates
+# 6. Transfer Certificates (State Board & CBSE)
 # ----------------------------------------------------------------------------
-TC_SPECS = [
-    ("tc_number", TEXT, [r"T\.?\s?C\.?\s*(?:No|Number)", r"Transfer\s+Certificate\s*(?:No|Number)", r"Serial\s*(?:No|Number)"]),
-    ("emis_number", TEXT, L_EMIS),
-    ("admission_number", TEXT, [r"Admission\s*(?:No|Number)"]),
-    ("school_name", TEXT, L_SCHOOL),
-    ("school_affiliation_number", TEXT, [r"Affiliation\s*(?:No|Number)"]),
-    ("school_address", TEXT, [r"School\s+Address"]),
-    ("student_name", TEXT, L_NAME),
-    ("father_name", TEXT, L_FATHER),
-    ("mother_name", TEXT, L_MOTHER),
-    ("nationality", TEXT, [r"Nationality"]),
-    ("religion", TEXT, [r"Religion"]),
-    ("community", TEXT, [r"Community(?:\s*(?:&|and)\s*Caste)?", r"Caste"]),
-    ("gender", TEXT, [r"\bSex\b", r"Gender"]),
-    ("date_of_birth", DATE, L_DOB),
-    ("date_of_admission", DATE, [r"Date\s+of\s+Admission"]),
-    ("scholarship_details", TEXT, [r"Scholarship"]),
-    ("medical_inspection", TEXT, [r"Medical\s+Inspection"]),
-    ("date_of_leaving", DATE, [r"Date\s+of\s+Leaving"]),
-    ("character_conduct", TEXT, [r"(?:Character|Conduct)(?:\s*(?:and|&)\s*(?:Character|Conduct))?"]),
-    ("date_of_tc", DATE, [r"Date\s+of\s+(?:issue\s+of\s+)?T\.?C\.?", r"Date\s+of\s+Issue"]),
-    ("course_of_study", TEXT, [r"Course\s+of\s+Study", r"Group"]),
-]
-
-
-def _make_tc_parser(standard, with_subjects, with_education_type):
-    def parser(text):
-        d = apply_specs(text, TC_SPECS)
-        d["standard"] = standard
-        marks = block_after(text, r"Identification\s+Marks?(?:\s+of\s+the\s+(?:Pupil|Student))?", 2)
-        d["identification_marks"] = _split_list(marks)
+def _make_tc_parser(standard: str, with_subjects: bool, with_education_type: bool, is_cbse: bool = False):
+    def parser(text: str) -> dict:
+        d = {
+            "tc_number": None,
+            "admission_number": None,
+            "school_name": None,
+            "school_address": None,
+            "student_name": None,
+            "father_name": None,
+            "mother_name": None,
+            "nationality": "Indian" if re.search(r"\bINDIAN\b", text, re.I) else None,
+            "religion": None,
+            "community": None,
+            "gender": None,
+            "date_of_birth": None,
+            "identification_marks": [],
+            "standard": standard,
+            "date_of_admission": None,
+            "scholarship_details": None,
+            "medical_inspection": None,
+            "date_of_leaving": None,
+            "character_conduct": None,
+            "date_of_tc": None,
+            "course_of_study": None,
+            "emis_number": None,
+        }
+        if is_cbse:
+            d["school_affiliation_number"] = None
         if with_education_type:
-            d["education_type"] = _convert(find_field(text, [r"Education\s+Type", r"Type\s+of\s+Education"]), TEXT)
+            d["education_type"] = None
         if with_subjects:
-            subs = block_after(text, r"Subjects?\s*(?:Studied|Offered)", 2)
-            d["subjects_offered"] = _split_list(subs)
+            d["subjects_offered"] = []
+
+        # School Name
+        m_sch = re.search(r"(?:[ao]f\s+the\s+School|பள்ளியின்\s*பெயர்)[^\)\n]*\)?\s*([A-Za-z0-9\s,\.\-]+)", text, re.I)
+        if m_sch:
+            s = re.sub(r"[\u0B80-\u0BFF]", "", m_sch.group(1)).strip(" :.-_»«")
+            s = re.sub(r"\s+[«<].*$", "", s)
+            d["school_name"] = re.sub(r"\s+", " ", s.strip())
+
+        # TC and Admission number
+        m_adm = re.search(r"(?:Admission\s*(?:No|Number)|சேர்க்கை\s*எண்)[^\n:]*[:\-]\s*([A-Za-z0-9/\-_]+)", text, re.I)
+        if m_adm:
+            d["admission_number"] = m_adm.group(1).strip()
+        m_tc = re.search(r"(?:T\.?C\.?\s*(?:No|Number)|Transfer\s+Certificate\s*(?:No|Number))[^\n:]*[:\-]\s*([A-Za-z0-9/\-_]+)", text, re.I)
+        if m_tc:
+            d["tc_number"] = m_tc.group(1).strip()
+
+        # EMIS
+        m_emis = re.search(r"(?:EMIS|எமிஸ்)[^\n\d]*(\d{10,20})", text, re.I)
+        if m_emis:
+            d["emis_number"] = m_emis.group(1)
+
+        # Student Name
+        m_name = re.search(r"(?:in\s+block\s+letters\)?|ஆங்கிலத்தில்)[^\n:]*[:\)]\s*([A-Za-z\s.]+)", text, re.I)
+        if m_name:
+            c = clean_name(m_name.group(1))
+            if c and len(c) >= 3 and not re.search(r"\b(?:GOVERNMENT|SCHOOL|TAMIL|NADU|AS|IN|THE|LE)\b", c):
+                d["student_name"] = c
+        if not d["student_name"]:
+            m_pupil = re.search(r"(?:Name\s+of\s+(?:the\s+)?(?:Pupil|Student)|மாணவரின்\s+பெயர்)[^\n:]*[:\)]\s*([A-Za-z\s.]+)", text, re.I)
+            if m_pupil:
+                c = clean_name(m_pupil.group(1))
+                if c and len(c) >= 3 and not re.search(r"\b(?:GOVERNMENT|SCHOOL|TAMIL|NADU|AS|IN|THE|LE)\b", c):
+                    d["student_name"] = c
+
+        # Parents
+        m_f = re.search(r"(?:Father(?:'?s)?\s*name|தந்தையின்\s*பெயர்)[^\)\n:]*[\):\-]\s*([A-Za-z\s.]+)", text, re.I)
+        if m_f:
+            d["father_name"] = clean_name(m_f.group(1))
+        m_m = re.search(r"(?:Mother(?:'?s)?\s*name|தாயின்\s*பெயர்)[^\)\n:]*[\):\-]\s*([A-Za-z\s.]+)", text, re.I)
+        if m_m:
+            d["mother_name"] = clean_name(m_m.group(1))
+
+        # Gender
+        m_gline = re.search(r"(?:Gender|பாலினம்)[^\n]*", text, re.I)
+        if m_gline:
+            gl = m_gline.group(0)
+            if re.search(r"\bFemale\b|பெண்", gl, re.I):
+                d["gender"] = "Female"
+            elif re.search(r"\bMale\b|ஆண்", gl, re.I):
+                d["gender"] = "Male"
+        if not d["gender"]:
+            if re.search(r"\bFemale\b", text, re.I):
+                d["gender"] = "Female"
+            elif re.search(r"\bMale\b", text, re.I):
+                d["gender"] = "Male"
+
+        # DOB
+        m_dob = re.search(r"(?:பிறந்த\s*CoP|Date\s+of\s+Birth|Date\s+of\s+N?e?t?h)[^\d\n]*(\d{1,2}[\-/]\d{1,2}[\-/]\d{4})", text, re.I)
+        if m_dob:
+            dt_val = m_dob.group(1)
+            if "2084" in dt_val and "TWO THOUSAND FOUR" in text.upper():
+                dt_val = dt_val.replace("2084", "2004")
+            d["date_of_birth"] = to_date(dt_val)
+
+        # Admission Date
+        m_adm_d = re.search(r"(?:சேர்க்கப்பட்ட|Admission\s*Date|Admission\s*Mate)[^\d\n]*(\d{1,2}[\-/]\d{1,2}[\-/]\d{4})", text, re.I)
+        if m_adm_d:
+            d["date_of_admission"] = to_date(m_adm_d.group(1))
+
+        # ID Marks
+        marks = []
+        for l in text.split("\n"):
+            if re.search(r"MOL[EPIL]\.?\s*ON", l, re.I):
+                m_mark = re.search(r"A\s*MOL[EPIL]\.?\s*ON\s+[A-Za-z\s]+", l, re.I)
+                if m_mark:
+                    clean_mark = re.sub(r"MOL[EPIL]\.?", "MOLE", m_mark.group(0), flags=re.I)
+                    clean_mark = re.sub(r"\bTHR\b", "THE", clean_mark, flags=re.I)
+                    clean_mark = re.sub(r"\bCLIN\b", "CHIN", clean_mark, flags=re.I)
+                    clean_mark = re.sub(r"\bLEE\b", "LEFT", clean_mark, flags=re.I)
+                    marks.append(re.sub(r"\s+", " ", clean_mark.strip()))
+        d["identification_marks"] = marks
+
+        # Education type
+        if with_education_type:
+            if re.search(r"General\s+Education", text, re.I):
+                d["education_type"] = "General Education"
+            elif re.search(r"Vocational\s+Education", text, re.I):
+                d["education_type"] = "Vocational Education"
+
+        # Subjects offered
+        if with_subjects:
+            m_sub = re.search(r"([A-Z]{4,}(?:[|/][A-Z]{4,}){2,})", text)
+            if m_sub:
+                subs = [s.strip() for s in re.split(r"[/|]", m_sub.group(1)) if len(s.strip()) > 2]
+                d["subjects_offered"] = subs
+
+        # Course of study
+        m_cos = re.search(r"(?:Course\s+of\s+Study|பாடப்பிரிவு)[^\n:]*[:\-]\s*([A-Za-z0-9\s,\-]+)", text, re.I)
+        if m_cos:
+            d["course_of_study"] = re.sub(r"\s+", " ", m_cos.group(1).strip())
+
         return d
+
     return parser
 
 
-parse_state_10th_tc = _make_tc_parser("10th", False, False)
-parse_state_12th_tc = _make_tc_parser("12th", True, True)
-parse_cbse_10th_tc = _make_tc_parser("10th", False, False)
-parse_cbse_12th_tc = _make_tc_parser("12th", True, True)
+parse_state_10th_tc = _make_tc_parser("10th", False, False, False)
+parse_state_12th_tc = _make_tc_parser("12th", True, True, False)
+parse_cbse_10th_tc = _make_tc_parser("10th", False, False, True)
+parse_cbse_12th_tc = _make_tc_parser("12th", True, True, True)
 
 
 # ----------------------------------------------------------------------------
-# 7. Supporting certificates
+# 7. Birth Certificate
 # ----------------------------------------------------------------------------
-# (label regex, column, kind) - order matters: first match wins
-_BC_LABELS = [
-    (r"Father",                                                        "father_name", TEXT),
-    (r"Mother",                                                        "mother_name", TEXT),
-    (r"(?:Registration|Certificate|Serial|Reference)\s*(?:No|Number)", "certificate_number", TEXT),
-    (r"\b(?:Sex|Gender)\b",                                            "gender", TEXT),
-    (r"Date\s+of\s+Birth|\bD\.?O\.?B\b",                               "date_of_birth", DATE),
-    (r"Place\s+of\s+Birth",                                            "place_of_birth", TEXT),
-    (r"Date\s+of\s+Issue|Issue\s+Date|\bDate\b",                       "issue_date", DATE),
-    (r"Issuing\s+Authority|Issued\s+By|\bRegistrar\b",                 "issuing_authority", TEXT),
-    (r"Address",                                                       "permanent_address", TEXT),
-    (r"\bName\b",                                                      "student_name", TEXT),
-]
-_BC_COLS = [c for _, c, _ in _BC_LABELS]
-_BC_KIND = {c: k for _, c, k in _BC_LABELS}
-_LABEL_ONLY = re.compile(r"^[A-Za-z' /.()\-]{2,40}?\s*:\s*$")
-_LABEL_INLINE = re.compile(r"^([A-Za-z' /.()\-]{2,40}?)\s*:\s*(\S.*)$")
-
-
-def _bc_column(label):
-    for rx, col, _ in _BC_LABELS:
-        if re.search(rx, label, re.I):
-            return col
-    return None
-
-
-def parse_birth_certificate(text):
-    """Handles 'Label : value' lines AND the layout where all labels come first,
-    followed by all values in the same order."""
-    d = {c: None for c in _BC_COLS}
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    junk = re.compile(r"SAMPLE DOCUMENT|DUMMY DATA|FOR SOFTWARE TESTING", re.I)
-
-    pending, inline_idx, last_label = [], set(), -1
-    for i, l in enumerate(lines):
-        if _LABEL_ONLY.match(l):
-            col = _bc_column(l.rstrip(" :"))
-            if col:
-                pending.append(col)
-                last_label = i
-            continue
-        m = _LABEL_INLINE.match(l)
-        if m and _bc_column(m.group(1)):
-            col = _bc_column(m.group(1))
-            if d[col] is None:
-                d[col] = m.group(2)
-            inline_idx.add(i)
-
-    # value lines = everything after the last label-only line that is not a label/junk
-    values = [l for i, l in enumerate(lines)
-              if i > last_label and i not in inline_idx and not junk.search(l)
-              and not _LABEL_ONLY.match(l)]
-
-    if pending and len(values) == len(pending):          # clean positional match
-        for col, val in zip(pending, values):
-            if d[col] is None:
-                d[col] = val
-    elif pending:                                        # counts differ: only certain types
-        for v in values:
-            if d["certificate_number"] is None and re.fullmatch(r"[A-Z]{0,3}[/\- ]?\d{2,4}[/\-]\d{3,8}", v):
-                d["certificate_number"] = v
-            elif d["gender"] is None and re.fullmatch(r"(?i)male|female|transgender|other", v):
-                d["gender"] = v
-        dates = [v for v in values if to_date(v)]
-        if dates and d["date_of_birth"] is None:
-            d["date_of_birth"] = dates[0]
-        if len(dates) > 1 and d["issue_date"] is None:
-            d["issue_date"] = dates[-1]
-
-    return {c: _convert(d[c], _BC_KIND[c]) for c in _BC_COLS}
-
-
-# ----------------------------------------------------------------------------
-# Aadhaar: one card, or several people's cards in one upload
-# ----------------------------------------------------------------------------
-VID_RE = re.compile(r"VID\s*:?\s*(?:\d{4}[ \t]?){4}", re.I)
-NUM_RE = re.compile(r"(?<!\d)(?<!\d[ \t])\d{4}[ \t]?\d{4}[ \t]?\d{4}(?![ \t]?\d)")
-
-
-def parse_aadhaar(text):
-    """Only the LAST 4 digits are ever returned - the full number is discarded everywhere."""
-    d = {"name_on_card": None, "date_of_birth": None, "father_name": None,
-         "address": None, "aadhaar_last_four": None}
-
-    text = VID_RE.sub(" ", text)  # a labelled 16-digit VID must never be read as the Aadhaar number
-    m = NUM_RE.search(text)
-    d["aadhaar_last_four"] = re.sub(r"\D", "", m.group())[-4:] if m else None
-
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    for i, line in enumerate(lines):
-        if re.search(r"\bDOB\b|Date\s+of\s+Birth|Year\s+of\s+Birth", line, re.I):
-            d["date_of_birth"] = to_date(line)
-            for j in range(i - 1, -1, -1):
-                if re.fullmatch(r"[A-Za-z .]{3,}", lines[j]) and not re.search(
-                    r"government|india|authority|unique|aadhaar|sample|photo", lines[j], re.I
-                ):
-                    d["name_on_card"] = lines[j]
-                    break
-            break
-
-    rel = find_field(text, [r"S/O", r"C/O", r"D/O", r"W/O"])
-    d["father_name"] = rel.strip(" ,:") if rel else None
-
-    addr = " ".join(block_after(text, r"Address", 4))
-    # the address ends where the 12-digit ID number starts (and the number must never be kept)
-    addr = re.split(r"\b\d{4}\s?\d{4}\s?\d{4}\b", addr)[0]
-    addr = re.split(r"SAMPLE DOCUMENT|VID\s*:", addr, flags=re.I)[0]
-    d["address"] = re.sub(r"\s+", " ", addr).strip(" ,-")[:500] or None
-    return d
-
-
-def split_cards(text):
-    """One block per Aadhaar number (each block ends at its number). Returns [(block_text, full_number)];
-    the full number is used only to group front/back of the same person in memory - never returned."""
-    text = VID_RE.sub(" ", text)
-    blocks, start = [], 0
-    for m in NUM_RE.finditer(text):
-        blocks.append([text[start:m.end()], re.sub(r"\s", "", m.group())])
-        start = m.end()
-    if blocks and text[start:].strip():
-        blocks[-1][0] += "\n" + text[start:]      # trailing footer text stays with the last card
-    return [tuple(b) for b in blocks]
-
-
-def process_multi_aadhaar(text):
-    """Several people's Aadhaar cards in one upload -> {'count': n, 'cards': [one dict per person]}."""
-    groups = {}
-    for block, num in split_cards(text):          # front + back of the same person share a number
-        groups.setdefault(num, []).append(block)
-
-    cards = []
-    for blocks in groups.values():
-        merged = {}
-        for b in blocks:
-            for k, v in parse_aadhaar(b).items():  # parse BEFORE masking
-                if v and not merged.get(k):
-                    merged[k] = v
-        cards.append(merged)
-
-    return {
-        "doc_type": "aadhaar_card",
-        "count": len(cards),
-        "cards": cards,
-        "extracted_text": mask_sensitive(text),
+def parse_birth_certificate(text: str) -> dict:
+    """Parse Form 5 and standard bilingual Birth Certificates."""
+    d = {
+        "certificate_number": None,
+        "student_name": None,
+        "gender": None,
+        "date_of_birth": None,
+        "place_of_birth": None,
+        "father_name": None,
+        "mother_name": None,
+        "permanent_address": None,
+        "issuing_authority": None,
+        "issue_date": None,
     }
 
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-# ---- narrative-style revenue certificates ----
-_TITLES = r"(?:Thiru|Thirumathi|Tmt|Selvi|Selvan|Kumari|Kum|Mr|Mrs|Ms|Shri|Sri|Smt)"
-_COMM_CODE = re.compile(r"\(\s*(MBC/DNC|MBC|BCM|DNC|BC|SCA|SC|ST|OC)\s*\)")
-_COMM_PHRASE = re.compile(
-    r"\b(Most\s+Backward\s+Class|Backward\s+Class|Scheduled\s+Caste|Scheduled\s+Tribe|Denotified\s+Communit(?:y|ies))\b", re.I
-)
+    # Student Name
+    m = re.search(r"(?:Name|பெயர்)\s*[:/]\s*(?:பெயர்\s*[:/]\s*)?([A-Za-z][A-Za-z .]{2,60})", text, re.I)
+    if not m:
+        m = re.search(r"Name\s*/\s*[^:\n]+:\s*([A-Za-z][A-Za-z .]{2,60})", text, re.I)
+    if m:
+        d["student_name"] = clean_name(m.group(1))
 
+    # Registration / Certificate Number
+    m_reg = re.search(r"(?:Registration\s*No|Certificate\s*No|பதிவு\s*எண்)[^\n\d]*[:\- ]\s*([A-Za-z0-9/_\- ]+)", text, re.I)
+    if m_reg and re.search(r"\d", m_reg.group(1)):
+        d["certificate_number"] = m_reg.group(1).strip()
+    if not d["certificate_number"]:
+        m_reg2 = re.search(r"(?<!\d)(\d{3,6}/\d{4}/\d{1,4})(?!\d)", text)
+        if m_reg2:
+            d["certificate_number"] = m_reg2.group(1)
+        else:
+            m_reg3 = re.search(r"(?<!\d)([A-Z]{1,3}/\d{4}/\d{4,8})(?!\d)", text)
+            if m_reg3:
+                d["certificate_number"] = m_reg3.group(1)
 
-def _narrative(text):
-    """Name / parent / address / caste / community read from sentence-style certificates.
-    Every value is None when the sentence is not there (labelled layouts are untouched)."""
-    flat = re.sub(r"\s+", " ", text)
-    out = {"name": None, "father": None, "address": None, "caste": None, "community": None}
+    # Gender
+    if re.search(r"\bFEMALE\b|பெண்பால்", text, re.I):
+        d["gender"] = "Female"
+    elif re.search(r"\bMALE\b|ஆண்பால்", text, re.I):
+        d["gender"] = "Male"
 
-    m = re.search(rf"certify\s+that\s+(?:{_TITLES}\.?\s+)?([A-Za-z][A-Za-z .]{{1,60}}?)\s*,?\s+(?:son|daughter|wife|ward)\s+of\b",
-                  flat, re.I)
-    if m:
-        out["name"] = m.group(1).strip(" ,.")
-    m = re.search(rf"(?:son|daughter|wife|ward)\s+of\s+(?:{_TITLES}\.?\s+)?([A-Za-z][A-Za-z .]{{1,60}}?)\s*,", flat, re.I)
-    if m:
-        out["father"] = m.group(1).strip(" ,.")
-    m = re.search(
-        r"(?:residing|resident|resides)\s+(?:at|in|of)\s+(.+?),?\s+"
-        r"(?:belongs?\s+to|belonging\s+to|and\s+belongs?|is\s+a\s+(?:member|native)|has\b|having\b)", flat, re.I)
-    if m:
-        out["address"] = m.group(1).strip(" ,.")
-    m = re.search(r"belongs?\s+to\s+(?:the\s+)?([A-Za-z][A-Za-z .]{1,40}?)\s+(?:caste|community)\b", flat, re.I)
-    if m:
-        out["caste"] = m.group(1).strip(" ,.")
-    m = _COMM_CODE.search(flat)
-    if m:
-        out["community"] = m.group(1)
+    # Dates
+    dates = []
+    for l in lines:
+        dt = to_date(l)
+        if dt:
+            dates.append(dt)
+
+    m_dob = re.search(r"(?:Date\s+of\s+Birth|பிறந்த\s+தேதி)[^\n\d]*[:\- ]\s*([0-9/\-\.]+)", text, re.I)
+    if m_dob and to_date(m_dob.group(1)):
+        d["date_of_birth"] = to_date(m_dob.group(1))
+
+    # Parents
+    m_f = re.search(r"(?:Name\s+of\s+Father|Father\s*(?:Name)?|தந்தையின்\s*பெயர்)[^\n:]*:\s*([A-Za-z][A-Za-z .]{2,50})", text, re.I)
+    if m_f:
+        d["father_name"] = clean_name(m_f.group(1))
+    m_m = re.search(r"(?:Name\s+of\s+Mother|Mother\s*(?:Name)?|தாயின்\s*பெயர்)[^\n:]*:\s*([A-Za-z][A-Za-z .]{2,50})", text, re.I)
+    if m_m:
+        d["mother_name"] = clean_name(m_m.group(1))
+
+    # Form 5 layout positional values block
+    if not d["father_name"] or not d["mother_name"]:
+        for l in lines:
+            m_cand = re.search(r"^:\s*([A-Z]\.[A-Z\s]{3,40})$", l)
+            if m_cand:
+                val = clean_name(m_cand.group(1))
+                if not d["father_name"] and val != d["student_name"]:
+                    d["father_name"] = val
+                elif d["father_name"] and not d["mother_name"] and val != d["student_name"] and val != d["father_name"]:
+                    d["mother_name"] = val
+
+    # Place of Birth
+    m_pob = re.search(r"(?:Place\s+of\s+Birth|பிறந்த\s+இடம்)[^\n:]*:\s*([A-Za-z0-9 ,.\-]{3,60})", text, re.I)
+    if m_pob and not re.search(r"[\u0B80-\u0BFF]", m_pob.group(1)):
+        d["place_of_birth"] = m_pob.group(1).strip(" :.-")
     else:
-        m = _COMM_PHRASE.search(flat)
-        out["community"] = re.sub(r"\s+", " ", m.group(1)) if m else None
-    return out
+        m_hosp = re.search(r":\s*([A-Z0-9\s,\.\-]+HOSPITAL[^\n]*)", text, re.I)
+        if m_hosp:
+            d["place_of_birth"] = m_hosp.group(1).strip(" :.-")
 
+    # Permanent address
+    m_addr = re.search(r":\s*(\d+[A-Za-z0-9\s,.\-]+(?:STREET|ROAD|NAGAR|T\.N\.|TAMILNADU|TAMIL\s+NADU)[^\n]*)", text, re.I)
+    if m_addr:
+        d["permanent_address"] = re.sub(r"\s+", " ", m_addr.group(1).strip(" :.-"))
 
-def _merge_narrative(d, text, mapping):
-    """Sentence-style values replace the label-based ones (which are unreliable on such layouts)."""
-    n = _narrative(text)
-    for key, col in mapping.items():
-        if n.get(key) and col in d:
-            d[col] = n[key]
-    cur = d.get("issuing_authority")
-    if cur is None or str(cur).startswith(","):
-        m = re.search(r"^\W*((?:Tahsildar|Tehsildar)\b[^\n]*)", text, re.I | re.M)
-        if m:
-            d["issuing_authority"] = re.sub(r"\s+", " ", m.group(1)).strip(" ,.")
+    # Dates assignment
+    if not d["date_of_birth"] and dates:
+        d["date_of_birth"] = min(dates)
+    if dates:
+        later = [dt for dt in dates if dt != d["date_of_birth"]]
+        if later:
+            d["issue_date"] = max(later)
+
+    # Authority
+    m_auth = re.search(r"(?:Issuing\s+Authority|வழங்குபவர்)[^\n:]*:\s*([A-Za-z\s,.\-]+)", text, re.I)
+    if m_auth:
+        d["issuing_authority"] = re.sub(r"\s+", " ", m_auth.group(1).strip(" :.-"))
+    elif re.search(r"MUNICIPAL\s+CORPORATION|Corporation|Municipality", text, re.I):
+        m_corp = re.search(r"([A-Za-z\s]+(?:MUNICIPAL\s+CORPORATION|Corporation|Municipality))", text, re.I)
+        if m_corp:
+            d["issuing_authority"] = re.sub(r"\s+", " ", m_corp.group(1).strip())
+
     return d
 
 
-def parse_community_certificate(text):
-    d = apply_specs(text, [
-        ("certificate_number", TEXT, [r"Community\s+Certificate\s*(?:No|Number)"] + L_CERT_NO),
-        ("candidate_name", TEXT, L_NAME),
-        ("father_name", TEXT, L_FATHER),
-        ("community_name", TEXT, [r"Community(?!\s+Certificate)"]),
-        ("caste_name", TEXT, [r"Caste"]),
-        ("address", TEXT, L_ADDRESS),
-        ("issuing_authority", TEXT, L_ISSUER + [r"Tahsildar", r"Tehsildar"]),
-        ("issue_date", DATE, L_ISSUE_DATE),
-    ])
-    return _merge_narrative(d, text, {"name": "candidate_name", "father": "father_name", "address": "address",
-                                      "caste": "caste_name", "community": "community_name"})
+# ----------------------------------------------------------------------------
+# 8. Aadhaar Card
+# ----------------------------------------------------------------------------
+def parse_aadhaar(text: str) -> dict:
+    """Parse Aadhaar card. Only last 4 digits are returned."""
+    d = {
+        "name_on_card": None,
+        "date_of_birth": None,
+        "father_name": None,
+        "address": None,
+        "aadhaar_last_four": None,
+    }
+
+    # Mask VID and get last 4 digits
+    text_clean = re.sub(r"VID\s*:?\s*(?:\d{4}[ \t]?){4}", " ", text, flags=re.I)
+    m_nums = re.findall(r"(?<!\d)\d{4}[ \t]?\d{4}[ \t]?(\d{4})(?!\d)", text_clean)
+    if m_nums:
+        d["aadhaar_last_four"] = m_nums[-1]
+
+    # DOB
+    m_dob = re.search(r"(?:DOB|Year\s+of\s+Birth|Date\s+of\s+Birth|பிறந்த\s+நாள்)\s*[:/]?\s*([0-9/\-\.]+)", text, re.I)
+    if m_dob and to_date(m_dob.group(1)):
+        d["date_of_birth"] = to_date(m_dob.group(1))
+
+    # Father / Relative: D/O, S/O, W/O, C/O: <Name>
+    m_rel = re.search(r"(?:[SDWC]/O|Father|Husband)\s*[:\-]?\s*([A-Za-z][A-Za-z .]{2,40})", text, re.I)
+    if m_rel:
+        d["father_name"] = clean_name(m_rel.group(1))
+
+    # Name on card: Anchor to line before DOB or line before D/O
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    cand_names = []
+
+    # Strategy 1: Prioritize line directly above DOB
+    for i, l in enumerate(lines):
+        if re.search(r"\b(?:DOB|Date\s+of\s+Birth|Year\s+of\s+Birth|பிறந்த\s+நாள்)\b", l, re.I):
+            for offset in range(1, 4):
+                if i - offset >= 0:
+                    cand = _strip_tamil(lines[i - offset])
+                    cand = re.sub(r"^[^A-Za-z]+|[^A-Za-z.]+$", "", cand).strip()
+                    if cand and len(cand) >= 3 and not re.search(r"\b(?:Government|India|Unique|Identification|Enrollment|Aadhaar|Male|Female|Address|DOB)\b", cand, re.I):
+                        c = clean_name(cand)
+                        if c:
+                            cand_names.append(c)
+                            break
+
+    # Strategy 2: Line directly above D/O, S/O
+    for i, l in enumerate(lines):
+        if re.search(r"\b[DSWC]/O\s*:", l, re.I):
+            for offset in range(1, 3):
+                if i - offset >= 0:
+                    cand = _strip_tamil(lines[i - offset])
+                    cand = re.sub(r"^[^A-Za-z]+|[^A-Za-z.]+$", "", cand).strip()
+                    if cand and len(cand) >= 3 and not re.search(r"\b(?:Government|India|Unique|Identification|Enrollment|Aadhaar|Male|Female|Address|To)\b", cand, re.I):
+                        c = clean_name(cand)
+                        if c:
+                            cand_names.append(c)
+                            break
+
+    if cand_names:
+        d["name_on_card"] = cand_names[0]
+
+    # Address: Either after D/O, S/O or "Address: ..." ending at 6-digit pincode
+    addr_lines = []
+    capturing = False
+    for l in lines:
+        if re.search(r"\b[DSWC]/O\s*:", l, re.I) or re.search(r"\b(?:Address|முகவரி)\b", l, re.I):
+            capturing = True
+            continue
+        if capturing:
+            clean = _strip_tamil(l)
+            clean = re.sub(r"[^\x20-\x7E]", " ", clean)
+            clean = re.sub(r"^[=\|<>\s\(\)\d/]+", "", clean).strip()
+            clean = re.sub(r"[\(\)\|<>=]+$", "", clean).strip()
+            if re.search(r"\b(?:Aadhaar|Unique|Government|India|DOB|Phone|Help)\b", clean, re.I):
+                break
+            if re.match(r"^\d{10}$", clean) or re.match(r"^\d{4}\s*\d{4}", clean):
+                break
+            if clean:
+                addr_lines.append(clean)
+            if re.search(r"\b\d{6}\b", l):
+                break
+    if addr_lines:
+        d["address"] = ", ".join(addr_lines)
+
+    return d
 
 
-def parse_income_certificate(text):
-    d = apply_specs(text, [
-        ("certificate_number", TEXT, L_CERT_NO),
-        ("candidate_name", TEXT, L_NAME),
-        ("annual_income", NUM, [r"Annual\s+(?:Family\s+)?Income", r"Income"]),
-        ("occupation", TEXT, [r"Occupation"]),
-        ("address", TEXT, L_ADDRESS),
-        ("issuing_authority", TEXT, L_ISSUER + [r"Tahsildar", r"Tehsildar"]),
-        ("issue_date", DATE, L_ISSUE_DATE),
-    ])
-    return _merge_narrative(d, text, {"name": "candidate_name", "address": "address"})
-
-
-def parse_nativity_certificate(text):
-    d = apply_specs(text, [
-        ("certificate_number", TEXT, L_CERT_NO),
-        ("candidate_name", TEXT, L_NAME),
-        ("address", TEXT, L_ADDRESS),
-        ("issuing_authority", TEXT, L_ISSUER + [r"Tahsildar", r"Tehsildar"]),
-        ("issue_date", DATE, L_ISSUE_DATE),
-    ])
-    return _merge_narrative(d, text, {"name": "candidate_name", "address": "address"})
-
-
-def _first_token(v):
-    """'7376211CS101, has passed the ...' -> '7376211CS101'."""
-    if not v:
-        return v
-    m = re.match(r"[A-Za-z0-9][A-Za-z0-9/\-]*", v.strip())
-    return m.group(0) if m else v
-
-
-def _header_line(text, keyword_rx):
-    """First short heading-style line containing the keyword (e.g. 'ANNA UNIVERSITY, CHENNAI')."""
-    for l in text.split("\n"):
-        l = l.strip()
-        if len(l) <= 80 and re.search(keyword_rx, l, re.I) and not re.search(r"certify|:", l, re.I):
-            return re.sub(r"\s+", " ", l).strip(" ,.")
+# ----------------------------------------------------------------------------
+# 9. Revenue Certificates (Community, Income, Nativity)
+# ----------------------------------------------------------------------------
+def _label_value(text: str, labels) -> Optional[str]:
+    """Read a value from common `Label: Value` certificate layouts."""
+    for line in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        for label in labels:
+            match = re.match(r"^\s*" + re.escape(label) + r"\s*(?:[:：=|/-])\s*(.*?)\s*$", line, re.I)
+            if match:
+                value = match.group(1).strip(" \t:：=|/-.,;")
+                if value and value not in {"-", "—", "N/A", "NA"}:
+                    return value
     return None
 
 
-_STOP = r"(?=\s+held\b|\s+with\b|\s+examination\b|\s+on\b|\s+and\s+is\b|,|\.\s|\.$|$)"
+def _first_date(text: str, labels=None) -> Optional[str]:
+    """Prefer dates attached to a matching label; otherwise use the existing date helper."""
+    if labels:
+        raw = _label_value(text, labels)
+        if raw:
+            date_match = re.search(r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b", raw)
+            if date_match:
+                parsed = to_date(date_match.group(0))
+                if parsed:
+                    return parsed
+    for line in (text or "").splitlines():
+        parsed = to_date(line)
+        if parsed:
+            return parsed
+    return None
 
 
-def _academic_narrative(text):
-    """'This is to certify that X, Register No. N, has passed ... degree of B.E. in CSE held in April 2024 ...'
-    Every value is None unless the text is written as such a sentence."""
-    flat = re.sub(r"\s+", " ", text)
-    out = dict.fromkeys(["name", "register", "degree", "department", "course", "year", "classification"])
-    if not re.search(r"certify\s+that", flat, re.I):
-        return out
-    m = re.search(rf"certify\s+that\s+(?:{_TITLES}\.?\s+)?([A-Za-z][A-Za-z .]{{1,60}}?)\s*[,(]", flat, re.I)
-    if m:
-        out["name"] = m.group(1).strip(" ,.")
-    m = re.search(r"Reg(?:ister|\.)?\s*(?:No|Number)\.?\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-]{3,})", flat, re.I)
-    if m:
-        out["register"] = m.group(1)
-    m = re.search(r"degree\s+of\s+((?:Bachelor|Master|Doctor)[A-Za-z .&()]*?)(?=\s+in\s|\s+held\b|\s+with\b|\s+on\b|,|\.\s|\.$|$)",
-                  flat, re.I)
-    if m:
-        out["degree"] = m.group(1).strip(" ,.")
-    m = re.search(rf"degree\s+of\s+(?:Bachelor|Master|Doctor)[A-Za-z .&()]*?\s+in\s+([A-Za-z .&()]+?){_STOP}", flat, re.I)
-    if m:
-        out["department"] = m.group(1).strip(" ,.")
-    m = re.search(rf"\b(diploma\s+in\s+[A-Za-z .&()]+?){_STOP}", flat, re.I)
-    if m:
-        out["course"] = m.group(1).strip(" ,.")
-    m = re.search(r"held\s+in\s+(?:[A-Za-z]+\s+)?((?:19|20)\d{2})", flat, re.I)
-    if m:
-        out["year"] = int(m.group(1))
-    m = re.search(r"(?:placed|declared|awarded|secured|passed)\s+(?:in\s+|the\s+|with\s+)?"
-                  r"((?:First|Second|Third)\s+Class(?:\s+with\s+(?:Distinction|Honou?rs))?|Distinction|Pass\s+Class)",
-                  flat, re.I)
-    if m:
-        out["classification"] = m.group(1).strip()
-    return out
+def parse_community_certificate(text: str) -> dict:
+    """Parse label/value and narrative-style Tamil Nadu community certificates."""
+    source = text or ""
+    d = {
+        "certificate_number": None,
+        "candidate_name": None,
+        "father_name": None,
+        "community_name": None,
+        "caste_name": None,
+        "address": None,
+        "issuing_authority": None,
+        "issue_date": None,
+    }
 
-
-def _finish_academic(d, text, mapping):
-    n = _academic_narrative(text)                      # sentence-style values replace the label-based ones
-    for key, col in mapping.items():
-        if n.get(key) is not None and col in d:
-            d[col] = n[key]
-    d["register_number"] = _first_token(d.get("register_number"))
-    if not d.get("college_name"):                      # college / university often appear only as a heading line
-        d["college_name"] = _header_line(text, r"\b(?:College|Institute|Polytechnic)\b")
-    if "university_name" in d and not d.get("university_name"):
-        d["university_name"] = _header_line(text, r"\bUniversity\b")
-    d["result"] = detect_result(text)
-    return d
-
-
-def parse_degree_certificate(text):
-    d = apply_specs(text, [
-        ("certificate_number", TEXT, L_CERT_NO),
-        ("college_name", TEXT, L_COLLEGE),
-        ("university_name", TEXT, [r"University\s+Name", r"University(?=\s*:)"]),
-        ("candidate_name", TEXT, L_NAME),
-        ("register_number", TEXT, [r"Register\s*(?:No|Number)", r"Reg\.?\s*No"]),
-        ("date_of_birth", DATE, L_DOB),
-        ("degree_name", TEXT, [r"Degree\s+Name", r"Degree(?=\s*[:\-–—])",
-                               r"Degree\s+of\s+(?=(?:Bachelor|Master|Doctor|B\.|M\.))"]),
-        ("department", TEXT, [r"Department", r"Branch", r"Subject"]),
-        ("graduation_year", INT, [r"Year\s+of\s+(?:Passing|Graduation)", r"Month\s+and\s+Year"]),
-        ("classification", TEXT, [r"Classification", r"Class\s+Obtained", r"Division"]),
+    # Explicit labels are the most reliable source for modern e-District layouts.
+    d["certificate_number"] = _label_value(source, [
+        "Certificate Number", "Certificate No", "Certificate No.", "Cert No",
+        "Certificate ID", "Application Number", "Application No",
     ])
-    return _finish_academic(d, text, {"name": "candidate_name", "register": "register_number", "degree": "degree_name",
-                                      "department": "department", "year": "graduation_year",
-                                      "classification": "classification"})
-
-
-def parse_diploma_certificate(text):
-    d = apply_specs(text, [
-        ("certificate_number", TEXT, L_CERT_NO),
-        ("college_name", TEXT, L_COLLEGE),
-        ("emis_number", TEXT, L_EMIS),
-        ("candidate_name", TEXT, L_NAME),
-        ("register_number", TEXT, [r"Register\s*(?:No|Number)", r"Reg\.?\s*No"]),
-        ("date_of_birth", DATE, L_DOB),
-        ("course_name", TEXT, [r"Course(?:\s+Name)?", r"Diploma\s+in"]),
-        ("department", TEXT, [r"Department", r"Branch"]),
-        ("completion_year", INT, [r"Year\s+of\s+(?:Passing|Completion)", r"Month\s+and\s+Year"]),
-        ("classification", TEXT, [r"Classification", r"Class\s+Obtained", r"Division"]),
+    d["candidate_name"] = _label_value(source, [
+        "Name of the Candidate", "Candidate Name", "Applicant Name", "Name",
     ])
-    return _finish_academic(d, text, {"name": "candidate_name", "register": "register_number", "course": "course_name",
-                                      "year": "completion_year", "classification": "classification"})
-
-
-_SEM_LINE = re.compile(
-    r"^[ \t]*(?P<code>[A-Z]{0,3}\d{3,6}[A-Z]?)[ \t]+(?P<name>[A-Za-z&,\-()/ ]+?)[ \t]+"
-    r"(?P<nums>(?:\d{1,3}(?:\.\d+)?[ \t]*)+?)(?P<grade>[A-Z]\+?)?[ \t]*$",
-    re.M,
-)
-
-_ROMAN_SEM = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8}
-
-
-def to_semester(s):
-    """'4', '4th', 'IV', 'Semester 4' -> 4. Anything else (e.g. an OCR-garbled 'A') -> None."""
-    if not s:
-        return None
-    m = re.search(r"(?<!\d)(\d{1,2})(?!\d)", s)
-    if m:
-        n = int(m.group(1))
-        return n if 1 <= n <= 12 else None
-    m = re.fullmatch(r"\W*([IVX]{1,4})\W*", s.strip(), re.I)
-    return _ROMAN_SEM.get(m.group(1).upper()) if m else None
-
-
-def parse_diploma_semester(text):
-    d = apply_specs(text, [
-        ("college_name", TEXT, L_COLLEGE),
-        ("emis_number", TEXT, L_EMIS),
-        ("candidate_name", TEXT, L_NAME),
-        ("register_number", TEXT, [r"Register\s*(?:No|Number)", r"Reg\.?\s*No"]),
-        ("date_of_birth", DATE, L_DOB),
-        ("course_name", TEXT, [r"Course(?:\s+Name)?", r"Diploma\s+in"]),
-        ("department", TEXT, [r"Department", r"Branch"]),
-        ("semester", TEXT, [r"Semester(?=\s*:)",
-                            r"\bSemester\s+(?:No\.?\s*)?(?=(?:\d{1,2}|[IVX]{1,4})\b)"]),
-        ("exam_month", TEXT, [r"Month\s+of\s+Examination", r"Exam(?:ination)?\s+Month"]),
-        ("exam_year", INT, [r"Year\s+of\s+Examination", r"Exam(?:ination)?\s+Year", r"Month\s+and\s+Year"]),
-        ("total_marks", NUM, [r"Grand\s+Total", r"Total\s+Marks"]),
-        ("maximum_marks", NUM, [r"Maximum\s+Marks"]),
-        ("percentage", NUM, [r"Percentage"]),
-        ("overall_grade", TEXT, [r"Overall\s+Grade", r"\bCGPA\b"]),
+    d["father_name"] = _label_value(source, [
+        "Father's Name", "Father’s Name", "Father Name", "Name of Father",
+        "Father / Guardian Name", "Father/Guardian Name",
     ])
-    d["register_number"] = _first_token(d.get("register_number"))
-    if not d.get("college_name"):
-        d["college_name"] = _header_line(text, r"\b(?:College|Institute|Polytechnic)\b")
-    d["semester"] = to_semester(d["semester"])
-    totals = []
-    for i, m in enumerate(_SEM_LINE.finditer(text), start=1):
-        if i > 8:
-            break
-        nums = [float(x) for x in m.group("nums").split()]
-        p = f"subject_{i}"
-        d[f"{p}_name"] = m.group("name").strip()
-        d[f"{p}_code"] = m.group("code")
-        d[f"{p}_total_marks"] = nums[-1]
-        if len(nums) >= 3:
-            d[f"{p}_internal_marks"] = nums[0]
-            d[f"{p}_external_marks"] = nums[1]
-        if len(nums) >= 4:
-            d[f"{p}_practical_marks"] = nums[2]
-        d[f"{p}_maximum_marks"] = 100.0
-        d[f"{p}_grade"] = m.group("grade")
-        totals.append(nums[-1])
-    if d.get("total_marks") is None and totals:
-        d["total_marks"] = float(sum(totals))
-        d["maximum_marks"] = d.get("maximum_marks") or 100.0 * len(totals)
-    if d.get("percentage") is None and d.get("total_marks") and d.get("maximum_marks"):
-        d["percentage"] = round(d["total_marks"] * 100 / d["maximum_marks"], 2)
-    d["result"] = detect_result(text)
-    return d
+    d["community_name"] = _label_value(source, ["Community Name", "Community", "Category"])
+    d["caste_name"] = _label_value(source, ["Caste Name", "Caste", "Sub Caste"])
+    d["address"] = _label_value(source, [
+        "Residential Address", "Permanent Address", "Address of Applicant", "Address", "Residence",
+    ])
+    d["issuing_authority"] = _label_value(source, [
+        "Issuing Authority", "Issued By", "Competent Authority", "Designation", "Authority",
+    ])
+    d["issue_date"] = _first_date(source, ["Date of Issue", "Issue Date", "Date of Issuance", "Issued Date"])
 
-
-# ----------------------------------------------------------------------------
-# 8. Validation - returns warnings only, never changes the parsed dict
-# ----------------------------------------------------------------------------
-_WORD_DIGIT = {"ZERO": "0", "ONE": "1", "TWO": "2", "THREE": "3", "FOUR": "4",
-               "FIVE": "5", "SIX": "6", "SEVEN": "7", "EIGHT": "8", "NINE": "9"}
-_WORD_RX = re.compile("|".join(_WORD_DIGIT))
-_DIGIT_WORDS = r"(?:ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)"
-
-
-def _words_val(s):
-    """'ZERO FOUR THREE SEVEN' / 'THREE FIVENINE' -> 437 / 359 (tolerates fused words)."""
-    digits = "".join(_WORD_DIGIT[w] for w in _WORD_RX.findall((s or "").upper()))
-    return int(digits) if digits else None
-
-
-def validate_state_12th(d, text=""):
-    warns = []
-    sub_totals = []
-    for prefix, _ in _HSS_SUBJECTS:
-        total = d.get(f"{prefix}_marks")
-        if total is None:
-            warns.append(f"{prefix}: marks not found")
-            continue
-        sub_totals.append(total)
-        parts = [d.get(f"{prefix}_{k}_marks") or 0 for k in ("theory", "practical", "internal")]
-        if sum(parts) != total:
-            warns.append(f"{prefix}: components {parts} do not add up to {total}")
-
-    if d.get("total_marks") is not None and sub_totals and sum(sub_totals) != d["total_marks"]:
-        warns.append(f"subject totals sum to {sum(sub_totals)}, but total_marks is {d['total_marks']}")
-
-    mx, tm, pct = d.get("maximum_total_marks"), d.get("total_marks"), d.get("percentage")
-    if mx and tm and pct is not None and abs(round(tm * 100 / mx, 2) - pct) > 0.01:
-        warns.append("percentage does not match total/maximum")
-
-    if not re.fullmatch(r"\d{10}", d.get("permanent_register_number") or ""):
-        warns.append("permanent register number is not 10 digits")
-    if not d.get("date_of_birth"):
-        warns.append("date of birth missing or invalid")
-    serial = d.get("certificate_serial_number")
-    if not serial:
-        warns.append("certificate serial number not read")
-    elif not re.fullmatch(r"HSS \d{7}", serial):
-        warns.append(f"serial number '{serial}' not in 'HSS #######' format")
-
-    m = re.search(rf"TOTAL\s+MARKS\s*[:\-]?\s*\d+\s+((?:{_DIGIT_WORDS}\s*)+)", text, re.I)
-    if m and d.get("total_marks") is not None:
-        w = _words_val(m.group(1))
-        if w is not None and w != int(d["total_marks"]):
-            warns.append(f"total in words ({w}) differs from total_marks ({int(d['total_marks'])})")
-    return warns
-
-
-def validate_state_10th(d, text=""):
-    warns = []
-    marks = [d.get(f"subject_{i}_marks") for i in range(1, _SSLC_ORDER + 1)]
-    got = [m for m in marks if m is not None]
-    if len(got) < _SSLC_ORDER:
-        warns.append(f"only {len(got)} of {_SSLC_ORDER} subject rows read")
-    if d.get("total_marks") is not None and got and sum(got) != d["total_marks"]:
-        warns.append(f"subject marks sum to {sum(got)}, but total_marks is {d['total_marks']}")
-    mx, tm, pct = d.get("maximum_total_marks"), d.get("total_marks"), d.get("percentage")
-    if mx and tm and pct is not None and abs(round(tm * 100 / mx, 2) - pct) > 0.01:
-        warns.append("percentage does not match total/maximum")
-
-    # each subject row: the last number must equal the marks written in words
-    row_rx = re.compile(rf"((?:(?<!\d)\d{{3}}(?!\d)[ \t]+){{1,3}})((?:{_NUM_WORDS}[ \t]*)+)")
-    for l in text.split("\n"):
-        if re.search(r"TOTAL\s+MARKS|HUNDRED", l, re.I):
-            continue
-        m = row_rx.search(l)
+    # Certificate numbers can contain slashes, hyphens, and year segments.
+    if not d["certificate_number"]:
+        m = re.search(r"(?i)(?:certificate\s*(?:no\.?|number|id)|application\s*(?:no\.?|number))\s*[:#/-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})", source)
         if m:
-            n = int(re.findall(r"\d{3}", m.group(1))[-1])
-            w = _words_val(m.group(2))
-            if w is not None and w != n:
-                warns.append(f"row {n}: words say {w}")
+            d["certificate_number"] = m.group(1).strip(" /-")
+        else:
+            m = re.search(r"\b[A-Z]{1,5}/\d{4}/[A-Z0-9/-]{3,18}\b", source, re.I)
+            if m:
+                d["certificate_number"] = m.group(0)
 
-    m = re.search(rf"TOTAL\s+MARKS\s*[:\-]?\s*(\d{{2,4}})\s+((?:{_DIGIT_WORDS}\s*)+)", text, re.I)
-    if m and _words_val(m.group(2)) not in (None, int(m.group(1))):
-        warns.append("total in words differs from the total in digits")
+    # Narrative-style certificate wording: “certify that ... son/daughter of ... residing ...”
+    if not d["candidate_name"] or not d["father_name"]:
+        m = re.search(
+            r"certify\s+that\s+(?:(?:Thiru|Selvi|Selvan|Kumari|Mr|Mrs|Ms|Shri|Sri|Smt)\.?\s*)?"
+            r"([A-Za-z][A-Za-z0-9 .]{1,60}?)\s+(?:son|daughter|wife|ward)\s+of\s+"
+            r"(?:(?:Thiru|Selvi|Selvan|Kumari|Mr|Mrs|Ms|Shri|Sri|Smt)\.?\s*)?"
+            r"([A-Za-z][A-Za-z0-9 .]{1,50}?)\s+(?:residing|ordinarily\s+reside)", source, re.I)
+        if m:
+            d["candidate_name"] = d["candidate_name"] or clean_name(m.group(1))
+            d["father_name"] = d["father_name"] or clean_name(m.group(2))
 
-    if not re.fullmatch(r"SEC \d{8}", d.get("certificate_serial_number") or ""):
-        warns.append("serial number not in 'SEC ########' format")
-    prn, roll = d.get("permanent_register_number") or "", d.get("roll_number") or ""
-    if not re.fullmatch(r"XM\d{2}R\d+", prn):
-        warns.append("permanent register number format unexpected")
-    elif not prn.endswith(roll):
-        warns.append("roll number does not match the end of the permanent register number")
-    if not d.get("date_of_birth"):
-        warns.append("date of birth missing or invalid")
+    if not d["address"]:
+        m = re.search(r"(?:residing|reside(?:s)?)\s+at\s+(.+?)(?=\s+belongs?\s+to\b|\n|$)", source, re.I | re.S)
+        if m:
+            d["address"] = re.sub(r"\s+", " ", m.group(1).strip(" ,.-"))
+
+    if not d["caste_name"]:
+        m = re.search(r"belongs?\s+to\s+([A-Za-z][A-Za-z0-9 .-]{1,60}?)\s+(?:Community|Caste)\b", source, re.I)
+        if m:
+            d["caste_name"] = re.sub(r"\s+", " ", m.group(1).strip(" ,.-"))
+
+    # Normalize community category without overwriting a more specific labelled value.
+    if d["community_name"]:
+        category = d["community_name"].strip()
+        if re.search(r"Most\s+Back\w*ard\s+Class|\bMBC\b", category, re.I):
+            d["community_name"] = "Most Backward Class"
+        elif re.search(r"Backward\s+Class|\bBC\b", category, re.I):
+            d["community_name"] = "Backward Class"
+        elif re.search(r"Scheduled\s+Caste|\bSC\b", category, re.I):
+            d["community_name"] = "Scheduled Caste"
+        elif re.search(r"Scheduled\s+Tribe|\bST\b", category, re.I):
+            d["community_name"] = "Scheduled Tribe"
+    elif re.search(r"Most\s+Back\w*ard\s+Class|\bMBC\b", source, re.I):
+        d["community_name"] = "Most Backward Class"
+    elif re.search(r"Backward\s+Class|\bBC\b", source, re.I):
+        d["community_name"] = "Backward Class"
+    elif re.search(r"Scheduled\s+Caste|\bSC\b", source, re.I):
+        d["community_name"] = "Scheduled Caste"
+    elif re.search(r"Scheduled\s+Tribe|\bST\b", source, re.I):
+        d["community_name"] = "Scheduled Tribe"
+
+    if not d["issuing_authority"]:
+        m = re.search(r"(?im)^.*?\b(?:Tahsildar|Tehsildar|Revenue\s+Divisional\s+Officer|Deputy\s+Tahsildar)\b[^\n]*", source)
+        if m:
+            d["issuing_authority"] = re.sub(r"\s+", " ", m.group(0).strip(" :/-"))
+
+    if not d["issue_date"]:
+        d["issue_date"] = _first_date(source)
+
+    if d["candidate_name"]:
+        d["candidate_name"] = clean_name(d["candidate_name"])
+    if d["father_name"]:
+        d["father_name"] = clean_name(d["father_name"])
+    return d
+
+
+def parse_income_certificate(text: str) -> dict:
+    """Parse common e-District income-certificate layouts and labelled OCR lines."""
+    d = apply_specs(text, [
+        ("certificate_number", TEXT, [r"Income\s+Certificate\s*(?:No|Number)"] + L_CERT_NAME),
+        ("candidate_name", TEXT, L_NAME),
+        ("annual_income", NUM, [r"Annual\s+(?:Family\s+)?Income", r"Family\s+Income", r"\bIncome\b"]),
+        ("occupation", TEXT, [r"Occupation", r"Profession"]),
+        ("address", TEXT, L_ADDRESS),
+        ("issuing_authority", TEXT, L_ISSUER + [r"Tahsildar", r"Tehsildar"]),
+        ("issue_date", DATE, L_ISSUE_DATE),
+    ])
+    fallbacks = {
+        "certificate_number": ["Certificate Number", "Certificate No", "Certificate No.", "Application Number"],
+        "candidate_name": ["Name of the Candidate", "Candidate Name", "Applicant Name", "Name"],
+        "annual_income": ["Annual Family Income", "Annual Income", "Family Income", "Income"],
+        "occupation": ["Occupation", "Profession"],
+        "address": ["Permanent Address", "Residential Address", "Address"],
+        "issuing_authority": ["Issuing Authority", "Issued By", "Competent Authority"],
+    }
+    for key, labels in fallbacks.items():
+        if not d.get(key):
+            value = _label_value(text, labels)
+            if value:
+                d[key] = value
+    if d.get("candidate_name"):
+        d["candidate_name"] = clean_name(d["candidate_name"])
+    if d.get("annual_income") is not None:
+        try:
+            amount = re.sub(r"[^0-9.]", "", str(d["annual_income"]))
+            d["annual_income"] = float(amount) if amount else None
+        except (TypeError, ValueError):
+            d["annual_income"] = None
+    if not d.get("certificate_number"):
+        m = re.search(r"(?i)(?:certificate\s*(?:no\.?|number)|application\s*(?:no\.?|number))\s*[:#/-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})", text or "")
+        if m:
+            d["certificate_number"] = m.group(1).strip(" /-")
+    if not d.get("issue_date"):
+        d["issue_date"] = _first_date(text, ["Date of Issue", "Issue Date", "Issued Date"])
+    return d
+
+
+def parse_nativity_certificate(text: str) -> dict:
+    """Parse Nativity / domicile certificates with labelled and narrative layouts."""
+    d = apply_specs(text, [
+        ("certificate_number", TEXT, [r"Nativity\s+Certificate\s*(?:No|Number)"] + L_CERT_NAME),
+        ("candidate_name", TEXT, L_NAME),
+        ("address", TEXT, L_ADDRESS),
+        ("issuing_authority", TEXT, L_ISSUER + [r"Tahsildar", r"Tehsildar"]),
+        ("issue_date", DATE, L_ISSUE_DATE),
+    ])
+    fallbacks = {
+        "certificate_number": ["Certificate Number", "Certificate No", "Certificate No.", "Application Number"],
+        "candidate_name": ["Name of the Candidate", "Candidate Name", "Applicant Name", "Name"],
+        "address": ["Permanent Address", "Residential Address", "Address"],
+        "issuing_authority": ["Issuing Authority", "Issued By", "Competent Authority"],
+    }
+    for key, labels in fallbacks.items():
+        if not d.get(key):
+            d[key] = _label_value(text, labels)
+    if d.get("candidate_name"):
+        d["candidate_name"] = clean_name(d["candidate_name"])
+    if not d.get("certificate_number"):
+        m = re.search(r"(?i)(?:certificate\s*(?:no\.?|number)|application\s*(?:no\.?|number))\s*[:#/-]?\s*([A-Z0-9][A-Z0-9/_-]{4,30})", text or "")
+        if m:
+            d["certificate_number"] = m.group(1).strip(" /-")
+    if not d.get("issue_date"):
+        d["issue_date"] = _first_date(text, ["Date of Issue", "Issue Date", "Issued Date"])
+    return d
+
+
+# ----------------------------------------------------------------------------
+# 10. Higher Education (Degree, Diploma Certificate, Diploma Semester)
+# ----------------------------------------------------------------------------
+def parse_degree_certificate(text: str) -> dict:
+    """Parse Degree Certificate."""
+    d = {
+        "certificate_number": None,
+        "college_name": None,
+        "university_name": None,
+        "candidate_name": None,
+        "register_number": None,
+        "date_of_birth": None,
+        "degree_name": None,
+        "department": None,
+        "graduation_year": None,
+        "classification": None,
+        "result": None,
+    }
+
+    # University / College
+    m_uni = re.search(r"([A-Za-z\s]+UNIVERSITY[^\n]*)", text, re.I)
+    if m_uni:
+        d["university_name"] = re.sub(r"\s+", " ", m_uni.group(1).strip())
+    m_col = re.search(r"([A-Za-z\s.,\-]+(?:COLLEGE|INSTITUTE)[^\n]*)", text, re.I)
+    if m_col:
+        d["college_name"] = re.sub(r"\s+", " ", m_col.group(1).strip(" :.-"))
+
+    # Candidate Name
+    m_name = re.search(r"(?:certify\s+that|Name\s*[:\-])\s*([A-Za-z\s.]+?)(?:has\s+passed|having|Register|\n)", text, re.I)
+    if m_name:
+        d["candidate_name"] = clean_name(m_name.group(1))
+
+    # Register Number
+    m_reg = re.search(r"(?:Register\s*(?:No|Number)|Reg\s*No)[^\w\n]*([A-Za-z0-9]+)", text, re.I)
+    if m_reg:
+        d["register_number"] = m_reg.group(1)
+
+    # Degree & Department
+    m_deg = re.search(r"(?:degree\s+of\s+|DEGREE\s+OF\s+)?\b(B\.?E\.?|B\.?TECH\.?|M\.?E\.?|M\.?TECH\.?|B\.?SC\.?|M\.?SC\.?|B\.?A\.?|M\.?A\.?|B\.?COM\.?|M\.?COM\.?|B\.?C\.?A\.?|M\.?C\.?A\.?)\b[^\n,]*", text, re.I)
+    if m_deg:
+        d["degree_name"] = m_deg.group(0).strip()
+    m_dept = re.search(r"(?:BRANCH|DEPARTMENT|IN)\s*[:\-]?\s*([A-Za-z\s]+(?:ENGINEERING|TECHNOLOGY|SCIENCE|ARTS|COMMERCE)[^\n,]*)", text, re.I)
+    if m_dept:
+        d["department"] = re.sub(r"\s+", " ", m_dept.group(1).strip())
+
+    # Graduation Year
+    m_yr = re.search(r"\b(20\d{2})\b", text)
+    if m_yr:
+        d["graduation_year"] = int(m_yr.group(1))
+
+    # Classification
+    if re.search(r"FIRST\s+CLASS\s+WITH\s+DISTINCTION", text, re.I):
+        d["classification"] = "FIRST CLASS WITH DISTINCTION"
+    elif re.search(r"FIRST\s+CLASS", text, re.I):
+        d["classification"] = "FIRST CLASS"
+    elif re.search(r"SECOND\s+CLASS", text, re.I):
+        d["classification"] = "SECOND CLASS"
+
+    d["result"] = detect_result(text)
+    return d
+
+
+def parse_diploma_certificate(text: str) -> dict:
+    """Parse Diploma Certificate."""
+    d = {
+        "certificate_number": None,
+        "college_name": None,
+        "emis_number": None,
+        "candidate_name": None,
+        "register_number": None,
+        "date_of_birth": None,
+        "course_name": None,
+        "department": None,
+        "completion_year": None,
+        "classification": None,
+        "result": None,
+    }
+
+    m_col = re.search(r"([A-Za-z\s.,\-]+(?:POLYTECHNIC|COLLEGE)[^\n]*)", text, re.I)
+    if m_col:
+        d["college_name"] = re.sub(r"\s+", " ", m_col.group(1).strip(" :.-"))
+
+    m_name = re.search(r"(?:certify\s+that|Name\s*[:\-])\s*([A-Za-z\s.]+?)(?:has\s+passed|having|Register|\n)", text, re.I)
+    if m_name:
+        d["candidate_name"] = clean_name(m_name.group(1))
+
+    m_reg = re.search(r"(?:Register\s*(?:No|Number)|Reg\s*No)[^\w\n]*([A-Za-z0-9]+)", text, re.I)
+    if m_reg:
+        d["register_number"] = m_reg.group(1)
+
+    m_crs = re.search(r"\bDIPLOMA\s+IN\s+([A-Za-z\s]+(?:ENGINEERING|TECHNOLOGY)[^\n,]*)", text, re.I)
+    if m_crs:
+        d["course_name"] = f"DIPLOMA IN {m_crs.group(1).strip()}"
+        d["department"] = m_crs.group(1).strip()
+
+    m_yr = re.search(r"\b(20\d{2})\b", text)
+    if m_yr:
+        d["completion_year"] = int(m_yr.group(1))
+
+    if re.search(r"FIRST\s+CLASS\s+WITH\s+DISTINCTION", text, re.I):
+        d["classification"] = "FIRST CLASS WITH DISTINCTION"
+    elif re.search(r"FIRST\s+CLASS", text, re.I):
+        d["classification"] = "FIRST CLASS"
+
+    d["result"] = detect_result(text)
+    return d
+
+
+def parse_diploma_semester(text: str) -> dict:
+    """Parse Diploma Semester Marksheet."""
+    d = {
+        "college_name": None,
+        "emis_number": None,
+        "candidate_name": None,
+        "register_number": None,
+        "date_of_birth": None,
+        "course_name": None,
+        "department": None,
+        "semester": None,
+        "exam_month": None,
+        "exam_year": None,
+        "total_marks": None,
+        "maximum_marks": None,
+        "percentage": None,
+        "overall_grade": None,
+        "result": None,
+    }
+
+    # Initialize 8 subjects
+    for i in range(1, 9):
+        d[f"subject_{i}_name"] = None
+        d[f"subject_{i}_code"] = None
+        d[f"subject_{i}_internal_marks"] = None
+        d[f"subject_{i}_external_marks"] = None
+        d[f"subject_{i}_practical_marks"] = None
+        d[f"subject_{i}_total_marks"] = None
+        d[f"subject_{i}_maximum_marks"] = 100.0
+        d[f"subject_{i}_grade"] = None
+        d[f"subject_{i}_credits"] = None
+
+    m_name = re.search(r"(?:Candidate(?:'s)?\s*Name|Name)[^\n:]*[:\-]\s*([A-Za-z\s.]+)", text, re.I)
+    if m_name:
+        d["candidate_name"] = clean_name(m_name.group(1))
+    m_reg = re.search(r"(?:Register\s*(?:No|Number)|Reg\s*No)[^\w\n]*([A-Za-z0-9]+)", text, re.I)
+    if m_reg:
+        d["register_number"] = m_reg.group(1)
+    m_sem = re.search(r"(?:SEMESTER|SEM)[^\w\n]*([0-9IVX]+)", text, re.I)
+    if m_sem:
+        d["semester"] = str(m_sem.group(1))
+
+    m_tot = re.search(r"(?:TOTAL\s*MARKS|TOTAL)[^\d\n]*(\d{2,4})", text, re.I)
+    if m_tot:
+        d["total_marks"] = float(m_tot.group(1))
+    d["result"] = detect_result(text)
+    return d
+
+
+# ----------------------------------------------------------------------------
+# 11. Validation
+# ----------------------------------------------------------------------------
+def validate_state_12th(d: dict, text: str = "") -> List[str]:
+    warns = []
+    if not d.get("candidate_name"):
+        warns.append("Candidate name not found on marksheet.")
+    if d.get("total_marks") is None:
+        warns.append("Total marks could not be verified.")
     return warns
 
+
+def validate_state_10th(d: dict, text: str = "") -> List[str]:
+    """Validate TN SSLC fields and flag inconsistent values without guessing replacements."""
+    warns = []
+    if not d.get("candidate_name"):
+        warns.append("Candidate name not found; verify against the original certificate.")
+    marks = [d.get(f"subject_{i}_marks") for i in range(1, 6)]
+    known = [float(v) for v in marks if v is not None]
+    for i, value in enumerate(marks, 1):
+        if value is not None and not 0 <= float(value) <= 100:
+            warns.append(f"Subject {i} marks are outside the expected 0-100 range.")
+    if len(known) < 5:
+        missing = [str(i) for i, value in enumerate(marks, 1) if value is None]
+        warns.append("Marks missing for subject(s): " + ", ".join(missing) + "; verify the scan.")
+    if d.get("total_marks") is None:
+        if len(known) == 5:
+            calculated = sum(known)
+            d["total_marks"] = float(calculated)
+        else:
+            warns.append("Total marks could not be verified because one or more subject marks are missing.")
+    elif len(known) == 5 and abs(float(d["total_marks"]) - sum(known)) > 0.01:
+        warns.append(f"Printed total ({d['total_marks']}) does not match the sum of extracted subject marks ({sum(known):g}). Verify the OCR and certificate.")
+    if d.get("total_marks") is not None and not 0 <= float(d["total_marks"]) <= 500:
+        warns.append("Total marks are outside the expected 0-500 range.")
+    return warns
 
 VALIDATORS = {
     "state_board_10th": validate_state_10th,
@@ -1324,9 +2198,7 @@ VALIDATORS = {
 
 
 def validate_document(doc_type: str, fields: dict, text: str = "", saved_name=None, saved_dob=None) -> list:
-    """Warnings for a parsed document ([] = all checks passed or no validator for this type).
-    If saved_name / saved_dob are given, the sheet is also compared with the saved record
-    (name differences that are only spacing/punctuation, e.g. 'V S' vs 'VS', are ignored)."""
+    """Warnings for a parsed document."""
     fn = VALIDATORS.get(doc_type)
     warns = fn(fields, text) if fn else []
     if saved_name or saved_dob:
@@ -1335,26 +2207,121 @@ def validate_document(doc_type: str, fields: dict, text: str = "", saved_name=No
 
 
 # ----------------------------------------------------------------------------
-# 9. Registry
+# 12. Registry
+# Exactly 16 document types mapping 1-to-1 to existing Supabase tables
 # ----------------------------------------------------------------------------
-def _cfg(table, parser, extracted_text=True, verification=True):
-    return {"table": table, "parser": parser,
-            "extracted_text": extracted_text, "verification": verification}
+def _cfg(table: str, parser, extracted_text: bool = True, verification: bool = True) -> dict:
+    return {
+        "table": table,
+        "parser": parser,
+        "extracted_text": extracted_text,
+        "verification": verification,
+    }
 
 
-DOC_TYPES = {
-    # marksheets (state-board tables have neither extracted_text nor verification columns)
+def detect_document_type(text: str) -> Optional[str]:
+    """Detect document type based on layout, keywords, and examination board headers."""
+    u = text.upper()
+
+    # Aadhaar Card
+    if re.search(r"\b(?:AADHAAR|UNIQUE\s+IDENTIFICATION|UIDAI|GOVERNMENT\s+OF\s+INDIA\s+MALE|GOVERNMENT\s+OF\s+INDIA\s+FEMALE)\b", u):
+        return "aadhaar_card"
+
+    # Transfer Certificates
+    if re.search(r"\b(?:TRANSFER\s+CERTIFICATE|மாற்றுச்\s*சான்றிதழ்)\b", u):
+        if "CBSE" in u:
+            return "cbse_12th_tc" if re.search(r"\b(?:XII|12TH|SENIOR)\b", u) else "cbse_10th_tc"
+        return "state_board_12th_tc" if re.search(r"\b(?:XII|12TH|SECOND\s+YEAR|HIGHER\s+SECONDARY)\b", u) else "state_board_10th_tc"
+
+    # Community / Caste Certificate
+    if re.search(r"\b(?:COMMUNITY\s+CERTIFICATE|CASTE\s+CERTIFICATE|சாதிச்\s*சான்றிதழ்)\b", u):
+        return "community_certificate"
+
+    # Income Certificate
+    if re.search(r"\b(?:INCOME\s+CERTIFICATE|வருமானச்\s*சான்றிதழ்)\b", u):
+        return "income_certificate"
+
+    # Nativity / Residence Certificate
+    if re.search(r"\b(?:NATIVITY\s+CERTIFICATE|RESIDENCE\s+CERTIFICATE|இருப்பிடச்\s*சான்றிதழ்)\b", u):
+        return "nativity_certificate"
+
+    # Birth Certificate
+    if re.search(r"\b(?:BIRTH\s+CERTIFICATE|CERTIFICATE\s+OF\s+BIRTH|பிறப்புச்\s*சான்றிதழ்)\b", u):
+        return "birth_certificate"
+
+    # Tamil Nadu SSLC 10th Marksheet
+    if re.search(r"\b(?:SECONDARY\s+SCHOOL\s+LEAVING\s+CERTIFICATE|X\s+STANDARD|பத்தாம்\s*வகுப்பு|SSLC)\b", u):
+        return "state_board_10th"
+
+    # Tamil Nadu Higher Secondary (+1 / 11th and +2 / 12th) Marksheets
+    if re.search(r"\b(?:HIGHER\s+SECONDARY|FIRST\s+YEAR\s+MARK|SECOND\s+YEAR\s+MARK|மேல்நிலைப்\s*பள்ளி)\b", u) or re.search(r"\b(?:HSS|HSC)\b", u):
+        if re.search(r"\b(?:FIRST\s+YEAR|முதலாமாண்டு|XI\s+STANDARD|\+1)\b", u) and not re.search(r"\bSECOND\s+YEAR|இரண்டாமாண்டு\b", u):
+            return "state_board_11th"
+        return "state_board_12th"
+
+    # CBSE Marksheets
+    if "CBSE" in u or "CENTRAL BOARD OF SECONDARY EDUCATION" in u:
+        if re.search(r"\b(?:SENIOR\s+SCHOOL|CLASS\s+XII|CLASS\s+12)\b", u):
+            return "cbse_12th_marksheet"
+        return "cbse_10th_marksheet"
+
+    # Degree & Diploma
+    if re.search(r"\b(?:DEGREE\s+EXAMINATION|BACHELOR|MASTER\s+OF)\b", u):
+        return "degree_certificate"
+    if re.search(r"\b(?:DIPLOMA\s+COURSE|POLYTECHNIC|DIRECTORATE\s+OF\s+TECHNICAL\s+EDUCATION)\b", u):
+        return "diploma_certificate"
+
+    return None
+
+
+def detect_scored(text: str) -> dict:
+    """Backward-compatible scored detection result for API routes.
+
+    This wraps the existing rule-based detector. Confidence is intentionally conservative;
+    uncertain layouts should be reviewed rather than silently treated as certain.
+    """
+    detected = detect_document_type(text or "")
+    if not detected:
+        return {"type": None, "ok": False, "score": 0.0, "confidence": 0.0,
+                "runner_up": None, "evidence": []}
+    u = (text or "").upper()
+    keywords = {
+        "state_board_10th": ["SECONDARY SCHOOL LEAVING CERTIFICATE", "SSLC", "X STANDARD"],
+        "state_board_12th": ["HIGHER SECONDARY", "HSC", "SECOND YEAR MARK"],
+        "state_board_11th": ["FIRST YEAR MARK", "XI STANDARD"],
+        "cbse_10th_marksheet": ["CBSE", "SECONDARY SCHOOL EXAMINATION", "CLASS X"],
+        "cbse_12th_marksheet": ["CBSE", "SENIOR SCHOOL CERTIFICATE", "CLASS XII"],
+        "state_board_10th_tc": ["TRANSFER CERTIFICATE", "SCHOOL"],
+        "state_board_12th_tc": ["TRANSFER CERTIFICATE", "HIGHER SECONDARY"],
+        "cbse_10th_tc": ["TRANSFER CERTIFICATE", "CBSE"],
+        "cbse_12th_tc": ["TRANSFER CERTIFICATE", "CBSE", "CLASS XII"],
+        "community_certificate": ["COMMUNITY CERTIFICATE", "COMMUNITY", "CASTE"],
+        "income_certificate": ["INCOME CERTIFICATE", "ANNUAL INCOME"],
+        "nativity_certificate": ["NATIVITY CERTIFICATE", "RESIDENCE CERTIFICATE"],
+        "birth_certificate": ["BIRTH CERTIFICATE", "DATE OF BIRTH"],
+        "aadhaar_card": ["AADHAAR", "UIDAI", "UNIQUE IDENTIFICATION"],
+    }
+    evidence = [word for word in keywords.get(detected, []) if word in u]
+    score = float(max(1, len(evidence)))
+    confidence = min(0.95, 0.45 + 0.1 * len(evidence))
+    return {"type": detected, "ok": bool(evidence), "score": score,
+            "confidence": round(confidence, 2), "runner_up": None, "evidence": evidence}
+
+
+DOC_TYPES: Dict[str, Dict[str, Any]] = {
+    # Marksheets
     "state_board_10th": _cfg("state_board_10th", parse_state_10th, False, False),
+    "state_board_11th": _cfg("state_board_12th", parse_state_11th, False, False),
     "state_board_12th": _cfg("state_board_12th", parse_state_12th, False, False),
     "cbse_10th_marksheet": _cfg("cbse_10th_marksheet", parse_cbse_10th, False, True),
     "cbse_12th_marksheet": _cfg("cbse_12th_marksheet", parse_cbse_12th, False, True),
     "diploma_semester_marksheet": _cfg("diploma_semester_marksheet", parse_diploma_semester, False, True),
-    # transfer certificates
+    # Transfer Certificates
     "state_board_10th_tc": _cfg("state_board_10th_tc", parse_state_10th_tc),
     "state_board_12th_tc": _cfg("state_board_12th_tc", parse_state_12th_tc),
     "cbse_10th_tc": _cfg("cbse_10th_tc", parse_cbse_10th_tc),
     "cbse_12th_tc": _cfg("cbse_12th_tc", parse_cbse_12th_tc),
-    # supporting certificates
+    # Supporting Certificates
     "birth_certificate": _cfg("birth_certificate", parse_birth_certificate),
     "aadhaar_card": _cfg("aadhaar_card", parse_aadhaar),
     "community_certificate": _cfg("community_certificate", parse_community_certificate),
@@ -1366,4 +2333,22 @@ DOC_TYPES = {
 
 
 def parse_document(doc_type: str, text: str) -> dict:
-    return DOC_TYPES[doc_type]["parser"](text)
+    """Execute parser for the requested document type and return structured fields."""
+    canonical_type = doc_type
+
+    # Dynamic layout adaptation for Tamil Nadu HSE Marksheets
+    if canonical_type in ("state_board_11th", "state_board_12th"):
+        u = text.upper()
+        if re.search(r"\b(?:FIRST\s+YEAR|முதலாமாண்டு|XI\s+STANDARD|\+1)\b", u) and not re.search(r"\bSECOND\s+YEAR|இரண்டாமாண்டு\b", u):
+            canonical_type = "state_board_11th"
+        elif re.search(r"\b(?:SECOND\s+YEAR|இரண்டாமாண்டு|XII\s+STANDARD|\+2)\b", u):
+            canonical_type = "state_board_12th"
+
+    if canonical_type not in DOC_TYPES:
+        detected = detect_document_type(text)
+        if detected and detected in DOC_TYPES:
+            canonical_type = detected
+        else:
+            raise ValueError(f"Unknown doc_type '{doc_type}'.")
+
+    return copy.deepcopy(DOC_TYPES[canonical_type]["parser"](text))

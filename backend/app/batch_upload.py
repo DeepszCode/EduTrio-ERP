@@ -1,92 +1,149 @@
 """
-batch_upload.py - read many students' certificates in one request and get the details back per student.
-PREVIEW ONLY: nothing is saved. To save a document use POST /upload/{doc_type} (it checks the student
-and stores the file + row).
+batch_upload.py — batch OCR preview for EduTrio / SMART ERP.
 
-Add to app/main.py (two lines):
-    from app.batch_upload import router as batch_router      # with the other imports
-    app.include_router(batch_router)                          # right after app = FastAPI(...)
+POST /batch-extract with repeated multipart fields:
+  files=<file>
+  students=<student ID or number>
+  doc_types=<key from GET /doc-types>
 
-Request: POST /batch-extract  (multipart/form-data). The three lists line up by position, one entry per file:
-    files=<file>   students=<student number or id>   doc_types=<a key of DOC_TYPES, see GET /doc-types>
-
-Example (2 files):
-    curl -F "files=@s1_aadhaar.jpg" -F "students=1" -F "doc_types=aadhaar_card" \
-         -F "files=@s2_marksheet.pdf" -F "students=2" -F "doc_types=state_board_10th" \
-         http://localhost:8000/batch-extract
+This endpoint previews extracted data only; it does not save files or rows.
 """
+import logging
 import os
+from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 try:
-    from app import ocr_service          # project layout: app/main.py, app/ocr_service.py
-except ImportError:                      # flat layout: files side by side
-    import ocr_service
+    from app import ocr_service
+except ImportError:
+    import ocr_service  # type: ignore
 
-MAX_FILES = 30       # per request; OCR of images is slow, so keep batches modest
-MAX_FILE_MB = 10     # same limit as main.py
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["Batch OCR"])
+
+MAX_FILES = 30
+MAX_FILE_MB = 10
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 ALLOWED_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 
 
-def _check_file(filename, content):
+def _check_file(filename: str, content: bytes) -> None:
     ext = os.path.splitext(filename or "")[1].lower()
     if ext not in ALLOWED_EXT:
-        raise ValueError(f"unsupported file type '{ext}'; allowed: {sorted(ALLOWED_EXT)}")
+        raise ValueError(
+            f"Unsupported file type '{ext or '(no extension)'}'. "
+            f"Allowed types: {', '.join(sorted(ALLOWED_EXT))}"
+        )
     if not content:
-        raise ValueError("empty file")
-    if len(content) > MAX_FILE_MB * 1024 * 1024:
-        raise ValueError(f"file larger than {MAX_FILE_MB} MB")
+        raise ValueError("The uploaded file is empty.")
+    if len(content) > MAX_FILE_BYTES:
+        raise ValueError(f"File exceeds the {MAX_FILE_MB} MB limit.")
 
 
-def process_batch(items, extract=None):
-    """items: [{"student", "doc_type", "filename", "content"}]  (content = file bytes)
+def _parse_fields(doc_type: str, text: str) -> dict[str, Any]:
+    """Parse fields without silently replacing uncertain OCR values."""
+    fields = ocr_service.parse_document(doc_type, text)
+    if not isinstance(fields, dict):
+        raise ValueError("The parser did not return a fields object.")
+    return fields
 
-    Every file is handled on its own: one bad file never stops the others, and one student's
-    data is never mixed with another's. Returns results grouped by student.
+
+def process_batch(items: list[dict[str, Any]], extract=None) -> dict[str, Any]:
+    """
+    Process each uploaded file independently.
+    Input item shape: student, doc_type, filename, content.
+    One failed document does not stop other documents in the batch.
     """
     extract = extract or ocr_service.extract_text
-    students, ok, failed = {}, 0, 0
-    for it in items:
-        student = str(it["student"]).strip() or "unassigned"
-        entry = {"filename": it["filename"], "doc_type": it["doc_type"]}
+    students: dict[str, list[dict[str, Any]]] = {}
+    ok = 0
+    failed = 0
+
+    for item in items:
+        student = str(item.get("student") or "").strip() or "unassigned"
+        doc_type = str(item.get("doc_type") or "").strip()
+        filename = str(item.get("filename") or "unnamed")
+        content = item.get("content") or b""
+
+        entry: dict[str, Any] = {
+            "filename": filename,
+            "doc_type": doc_type,
+        }
+
         try:
-            cfg = ocr_service.DOC_TYPES.get(it["doc_type"])
-            if cfg is None:
+            cfg = ocr_service.DOC_TYPES.get(doc_type)
+            if not cfg:
+                valid_types = ", ".join(sorted(ocr_service.DOC_TYPES))
                 raise ValueError(
-                    f"unknown doc_type '{it['doc_type']}'; valid types: {', '.join(sorted(ocr_service.DOC_TYPES))}"
+                    f"Unknown doc_type '{doc_type}'. Valid types: {valid_types}"
                 )
-            _check_file(it["filename"], it["content"])
-            text = extract(it["content"], it["filename"])
-            if not text or not text.strip():
-                raise ValueError("no text could be read from this file")
 
-            if it["doc_type"] == "aadhaar_card":
-                # one image/PDF may hold several people's cards -> one entry per person
-                multi = ocr_service.process_multi_aadhaar(text)   # parses BEFORE masking
-                if multi["cards"]:
-                    entry["cards"] = multi["cards"]
-                    entry["fields"] = multi["cards"][0]
+            _check_file(filename, content)
+            text = extract(content, filename)
+
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(
+                    "No readable text was extracted. Try a clearer scan or PDF."
+                )
+
+            # Parse the original OCR text first; mask only the optional text returned.
+            if doc_type == "aadhaar_card" and hasattr(
+                ocr_service, "process_multi_aadhaar"
+            ):
+                multi = ocr_service.process_multi_aadhaar(text)
+                cards = multi.get("cards", []) if isinstance(multi, dict) else []
+                if cards:
+                    entry["cards"] = cards
+                    entry["fields"] = cards[0]
                 else:
-                    entry["fields"] = ocr_service.parse_document("aadhaar_card", text)
+                    entry["fields"] = _parse_fields(doc_type, text)
             else:
-                entry["fields"] = ocr_service.parse_document(it["doc_type"], text)  # parse BEFORE masking
+                entry["fields"] = _parse_fields(doc_type, text)
 
-            entry["table"] = cfg["table"]
-            if cfg["extracted_text"]:
-                entry["extracted_text"] = ocr_service.mask_sensitive(text)          # full ID numbers never returned
+            entry["table"] = cfg.get("table")
+            if cfg.get("extracted_text"):
+                mask = getattr(ocr_service, "mask_sensitive", None)
+                entry["extracted_text"] = mask(text) if callable(mask) else text
+
+            # Include validation output when the existing service supports it.
+            validate = getattr(ocr_service, "validate_document", None)
+            if callable(validate):
+                try:
+                    validation = validate(doc_type, entry["fields"])
+                    if validation is not None:
+                        entry["validation"] = validation
+                except Exception:
+                    logger.exception(
+                        "Validation failed for %s (%s)", filename, doc_type
+                    )
+                    entry["validation_warning"] = (
+                        "Fields were extracted, but validation could not complete."
+                    )
+
             entry["status"] = "ok"
             ok += 1
-        except Exception as e:  # keep going with the remaining files
+
+        except Exception as exc:
+            logger.exception(
+                "Batch OCR failed for file=%s student=%s doc_type=%s",
+                filename,
+                student,
+                doc_type,
+            )
             entry["status"] = "failed"
-            entry["error"] = f"{type(e).__name__}: {e}"
+            entry["error"] = f"{type(exc).__name__}: {exc}"
             failed += 1
+
         students.setdefault(student, []).append(entry)
-    return {"ok": ok, "failed": failed, "students": students}
 
-
-router = APIRouter()
+    return {
+        "ok": ok,
+        "failed": failed,
+        "total": len(items),
+        "students": students,
+    }
 
 
 @router.post("/batch-extract")
@@ -97,14 +154,34 @@ async def batch_extract(
 ):
     if not (len(files) == len(students) == len(doc_types)):
         raise HTTPException(
-            400,
-            f"got {len(files)} files, {len(students)} students, {len(doc_types)} doc_types - "
-            "they must match one-to-one, in the same order",
+            status_code=400,
+            detail=(
+                f"Received {len(files)} files, {len(students)} students, "
+                f"and {len(doc_types)} document types. These lists must have "
+                "the same length and the same order."
+            ),
         )
+
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload at least one file.")
     if len(files) > MAX_FILES:
-        raise HTTPException(400, f"at most {MAX_FILES} files per request")
-    items = []
-    for f, s, t in zip(files, students, doc_types):
-        content = await f.read(MAX_FILE_MB * 1024 * 1024 + 1)   # never read more than the limit + 1 byte
-        items.append({"student": s, "doc_type": t, "filename": f.filename or "", "content": content})
+        raise HTTPException(
+            status_code=400,
+            detail=f"A maximum of {MAX_FILES} files is allowed per request.",
+        )
+
+    items: list[dict[str, Any]] = []
+    for file, student, doc_type in zip(files, students, doc_types):
+        # Read at most one byte over the limit to avoid loading huge uploads.
+        content = await file.read(MAX_FILE_BYTES + 1)
+        items.append(
+            {
+                "student": student,
+                "doc_type": doc_type,
+                "filename": file.filename or "",
+                "content": content,
+            }
+        )
+        await file.close()
+
     return await run_in_threadpool(process_batch, items)

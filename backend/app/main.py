@@ -33,6 +33,7 @@ from app.ocr_service import (
     mask_sensitive,
     parse_document,
     validate_document,
+    detect_document_type,
 )
 
 from app.ai_routes import router as ai_router
@@ -138,10 +139,23 @@ def get_sb() -> Client:
 # Helpers
 # ---------------------------------------------------------------------------
 
+DOC_TYPE_ALIASES = {
+    "transfer_certificate": "state_board_10th_tc",
+    "degree_marksheet": "degree_certificate",
+    "11th_marksheet": "state_board_11th",
+    "10th_marksheet": "state_board_10th",
+    "12th_marksheet": "state_board_12th",
+    "state_board_11th_marksheet": "state_board_11th",
+    "state_board_10th_marksheet": "state_board_10th",
+    "state_board_12th_marksheet": "state_board_12th",
+}
+
+
 def get_cfg(doc_type: str) -> dict:
     """Get the configuration for a supported certificate type."""
 
-    cfg = DOC_TYPES.get(doc_type)
+    canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
+    cfg = DOC_TYPES.get(canonical_type)
 
     if not cfg:
         raise HTTPException(
@@ -184,8 +198,9 @@ def read_upload(file: UploadFile) -> bytes:
     return content
 
 
+
 def run_ocr(doc_type: str, content: bytes, filename: str):
-    """Extract text and parse certificate fields."""
+    """Extract text and normalize parser output for certificate fields."""
 
     try:
         text = extract_text(content, filename)
@@ -201,9 +216,28 @@ def run_ocr(doc_type: str, content: bytes, filename: str):
             detail="No readable text was found in this file.",
         )
 
-    fields = parse_document(doc_type, text)
+    try:
+        parsed = parse_document(doc_type, text)
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Certificate parsing failed. Check the OCR parser.",
+        )
+
+    # Some parsers return {"fields": {...}}, while others
+    # may return the fields dictionary directly.
+    if isinstance(parsed, dict) and isinstance(parsed.get("fields"), dict):
+        fields = parsed["fields"]
+    elif isinstance(parsed, dict):
+        fields = parsed
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="The certificate parser returned an invalid result.",
+        )
 
     return text, fields
+
 
 
 def signed_url(
@@ -340,23 +374,40 @@ def extract_only(
 ):
     """Preview OCR and parsed fields without saving the certificate."""
 
-    get_cfg(doc_type)
-
     content = read_upload(file)
 
-    text, fields = run_ocr(
-        doc_type,
-        content,
-        file.filename or "",
-    )
+    if doc_type.lower() in ("auto", "detect"):
+        text = extract_text(content, file.filename or "")
+        canonical_type = detect_document_type(text) or "state_board_12th"
+        cfg = get_cfg(canonical_type)
+        parsed = parse_document(canonical_type, text)
+        fields = parsed.get("fields", parsed) if isinstance(parsed, dict) else {}
+    else:
+        cfg = get_cfg(doc_type)
+        canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
+        text, fields = run_ocr(
+            canonical_type,
+            content,
+            file.filename or "",
+        )
+
+    # Reflect detected standard for State Board marksheets
+    if fields.get("standard") == "11th" and canonical_type == "state_board_12th":
+        canonical_type = "state_board_11th"
+    elif fields.get("standard") == "12th" and canonical_type == "state_board_11th":
+        canonical_type = "state_board_12th"
 
     warnings = validate_document(
-        doc_type,
+        canonical_type,
         fields,
         text,
     )
 
-    candidate_name = fields.get("candidate_name")
+    candidate_name = (
+        fields.get("candidate_name")
+        or fields.get("student_name")
+        or fields.get("name_on_card")
+    )
 
     if student_id and candidate_name:
         for saved_name in known_names(student_id):
@@ -371,7 +422,7 @@ def extract_only(
                 break
 
     return {
-        "doc_type": doc_type,
+        "doc_type": canonical_type,
         "fields": fields,
         "warnings": warnings,
         "extracted_text": mask_sensitive(text),
@@ -398,6 +449,7 @@ def upload_certificate(
     """
 
     cfg = get_cfg(doc_type)
+    canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
     sb = get_sb()
 
     # Verify that the student exists.
@@ -428,7 +480,7 @@ def upload_certificate(
     content = read_upload(file)
 
     text, fields = run_ocr(
-        doc_type,
+        canonical_type,
         content,
         file.filename or "",
     )
@@ -467,7 +519,7 @@ def upload_certificate(
     ext = os.path.splitext(filename)[1].lower()
 
     storage_path = (
-        f"{doc_type}/{student_id}/{uuid.uuid4().hex}{ext}"
+        f"{canonical_type}/{student_id}/{uuid.uuid4().hex}{ext}"
     )
 
     # Upload original certificate to Supabase Storage.
@@ -528,7 +580,7 @@ def upload_certificate(
 
     return {
         "saved": True,
-        "doc_type": doc_type,
+        "doc_type": canonical_type,
         "record": saved_record,
     }
 
