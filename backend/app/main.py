@@ -312,6 +312,27 @@ def health():
 
 
 @app.get("/health/supabase", tags=["Health"])
+@app.get("/debug/student/{student_id}", tags=["Health"])
+def debug_student(student_id: int):
+    """Check whether a student ID is visible to the backend."""
+    try:
+        result = (
+            get_sb()
+            .table("student_identification")
+            .select("student_id")
+            .eq("student_id", student_id)
+            .execute()
+        )
+        return {
+            "requested_student_id": student_id,
+            "found": bool(result.data),
+            "matching_rows": result.data or [],
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Student lookup failed: {type(exc).__name__}",
+        )
 def health_supabase():
     """Check Supabase configuration, database access, and storage."""
 
