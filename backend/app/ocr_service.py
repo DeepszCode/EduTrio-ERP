@@ -8,6 +8,7 @@ import io
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -168,6 +169,8 @@ def _serial_crop_ocr(variants: dict) -> Optional[str]:
 
 def _ocr_image(img: Image.Image) -> str:
     """Multi-pass OCR with score-based variant selection, plus high-res top & table crops for State Board marksheets."""
+    started = time.perf_counter()
+    print("[OCR-TIMING] _ocr_image started", flush=True)
     img.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
     variants = _variants(img)
     best_score = -1
@@ -220,6 +223,7 @@ def _ocr_image(img: Image.Image) -> str:
                 best_text += "\n--- TABLE CROP ---\n" + txt_table
         except Exception:
             pass
+    print(f"[OCR-TIMING] _ocr_image finished in {time.perf_counter() - started:.2f}s", flush=True)
 
     return best_text
 
