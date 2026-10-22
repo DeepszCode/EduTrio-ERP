@@ -175,7 +175,7 @@ def _ocr_image(img: Image.Image) -> str:
 
     ocr_lang = _effective_ocr_lang()
 
-    for name in ("plain", "otsu"):
+    for name in ("plain",):
         arr = variants[name]
         for psm in (6, 3):
             cfg = f"--oem 3 --psm {psm}"
