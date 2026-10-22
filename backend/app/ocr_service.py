@@ -45,7 +45,7 @@ def _effective_ocr_lang(requested: str = TESS_LANG) -> str:
         wanted.insert(0, "eng")
     return "+".join(dict.fromkeys(wanted)) or ("eng" if "eng" in available else next(iter(available)))
 MIN_PDF_TEXT_CHARS = 80
-PDF_DPI = 300
+PDF_DPI = 180
 
 # Windows Tesseract path: checks .env, default Program Files, AppData user location, or PATH
 _DEFAULT_TESS = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -168,6 +168,7 @@ def _serial_crop_ocr(variants: dict) -> Optional[str]:
 
 def _ocr_image(img: Image.Image) -> str:
     """Multi-pass OCR with score-based variant selection, plus high-res top & table crops for State Board marksheets."""
+    img.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
     variants = _variants(img)
     best_score = -1
     best_text = ""
