@@ -171,7 +171,7 @@ def _ocr_image(img: Image.Image) -> str:
     """Multi-pass OCR with score-based variant selection, plus high-res top & table crops for State Board marksheets."""
     started = time.perf_counter()
     print("[OCR-TIMING] _ocr_image started", flush=True)
-    img.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+    img.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
     variants = _variants(img)
     best_score = -1
     best_text = ""
