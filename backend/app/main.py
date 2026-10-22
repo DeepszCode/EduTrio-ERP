@@ -1,9 +1,9 @@
 
 """
 main.py - SMART ERP Certificate Service
-FastAPI + Supabase + OCR + OpenAI AI Assistant
+FastAPI + Supabase + OCR + AI Assistant
 
-Run from the project root:
+Run from backend:
     python -m uvicorn app.main:app --reload --reload-dir app --port 8000
 
 API docs:
@@ -24,7 +24,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
 
-# Load .env from the project root.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from app.ocr_service import (
@@ -35,7 +34,6 @@ from app.ocr_service import (
     validate_document,
     detect_document_type,
 )
-
 from app.ai_routes import router as ai_router
 
 
@@ -60,13 +58,18 @@ BUCKET = (
 MAX_FILE_MB = 10
 
 ALLOWED_EXT = {
-    ".pdf",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".tif",
-    ".tiff",
+    ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"
+}
+
+DOC_TYPE_ALIASES = {
+    "transfer_certificate": "state_board_10th_tc",
+    "degree_marksheet": "degree_certificate",
+    "11th_marksheet": "state_board_11th",
+    "10th_marksheet": "state_board_10th",
+    "12th_marksheet": "state_board_12th",
+    "state_board_11th_marksheet": "state_board_11th",
+    "state_board_10th_marksheet": "state_board_10th",
+    "state_board_12th_marksheet": "state_board_12th",
 }
 
 
@@ -76,14 +79,13 @@ ALLOWED_EXT = {
 
 app = FastAPI(
     title="SMART ERP - Certificate OCR",
-    version="1.2.0",
+    version="1.2.1",
     description=(
         "Certificate OCR, Supabase storage, student records, "
         "verification, and AI Assistant API."
     ),
 )
 
-# Register AI Assistant endpoints.
 app.include_router(ai_router)
 
 app.add_middleware(
@@ -107,7 +109,6 @@ _sb: Optional[Client] = None
 
 def get_sb() -> Client:
     """Create and reuse the Supabase client."""
-
     global _sb
 
     if _sb is None:
@@ -116,8 +117,7 @@ def get_sb() -> Client:
                 status_code=500,
                 detail=(
                     "Supabase configuration is missing. "
-                    "Check SUPABASE_URL and SUPABASE_KEY "
-                    "or SUPABASE_SERVICE_ROLE_KEY in .env."
+                    "Check SUPABASE_URL and backend Supabase key settings."
                 ),
             )
 
@@ -126,10 +126,7 @@ def get_sb() -> Client:
         except Exception:
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "Could not create the Supabase client. "
-                    "Check backend configuration."
-                ),
+                detail="Could not initialize Supabase.",
             )
 
     return _sb
@@ -139,21 +136,8 @@ def get_sb() -> Client:
 # Helpers
 # ---------------------------------------------------------------------------
 
-DOC_TYPE_ALIASES = {
-    "transfer_certificate": "state_board_10th_tc",
-    "degree_marksheet": "degree_certificate",
-    "11th_marksheet": "state_board_11th",
-    "10th_marksheet": "state_board_10th",
-    "12th_marksheet": "state_board_12th",
-    "state_board_11th_marksheet": "state_board_11th",
-    "state_board_10th_marksheet": "state_board_10th",
-    "state_board_12th_marksheet": "state_board_12th",
-}
-
-
 def get_cfg(doc_type: str) -> dict:
-    """Get the configuration for a supported certificate type."""
-
+    """Return the configuration for a supported certificate type."""
     canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
     cfg = DOC_TYPES.get(canonical_type)
 
@@ -168,17 +152,13 @@ def get_cfg(doc_type: str) -> dict:
 
 def read_upload(file: UploadFile) -> bytes:
     """Read and validate an uploaded file."""
-
     filename = file.filename or ""
-    ext = os.path.splitext(filename)[1].lower()
+    ext = Path(filename).suffix.lower()
 
     if ext not in ALLOWED_EXT:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Unsupported file type '{ext}'. "
-                f"Allowed extensions: {sorted(ALLOWED_EXT)}"
-            ),
+            detail=f"Unsupported file extension: '{ext}'.",
         )
 
     content = file.file.read()
@@ -198,10 +178,8 @@ def read_upload(file: UploadFile) -> bytes:
     return content
 
 
-
 def run_ocr(doc_type: str, content: bytes, filename: str):
-    """Extract text and normalize parser output for certificate fields."""
-
+    """Extract text and parse certificate fields."""
     try:
         text = extract_text(content, filename)
     except Exception:
@@ -221,11 +199,9 @@ def run_ocr(doc_type: str, content: bytes, filename: str):
     except Exception:
         raise HTTPException(
             status_code=422,
-            detail="Certificate parsing failed. Check the OCR parser.",
+            detail="Certificate parsing failed.",
         )
 
-    # Some parsers return {"fields": {...}}, while others
-    # may return the fields dictionary directly.
     if isinstance(parsed, dict) and isinstance(parsed.get("fields"), dict):
         fields = parsed["fields"]
     elif isinstance(parsed, dict):
@@ -239,31 +215,22 @@ def run_ocr(doc_type: str, content: bytes, filename: str):
     return text, fields
 
 
-
-def signed_url(
-    path: Optional[str],
-    expires: int = 3600,
-) -> Optional[str]:
+def signed_url(path: Optional[str], expires: int = 3600):
     """Create a temporary URL for a stored certificate."""
-
     if not path:
         return None
 
     try:
         result = get_sb().storage.from_(BUCKET).create_signed_url(
-            path,
-            expires,
+            path, expires
         )
-
         return result.get("signedURL") or result.get("signedUrl")
-
     except Exception:
         return None
 
 
 def known_names(student_id: int) -> list:
-    """Get candidate names already saved for the student."""
-
+    """Get previously saved candidate names for a student."""
     names = []
 
     for table in ("state_board_10th", "state_board_12th"):
@@ -275,25 +242,18 @@ def known_names(student_id: int) -> list:
                 .eq("student_id", student_id)
                 .execute()
             )
-
-            rows = result.data or []
-
             names.extend(
                 row["candidate_name"]
-                for row in rows
+                for row in (result.data or [])
                 if row.get("candidate_name")
             )
-
         except Exception:
-            # A missing table should not break OCR preview.
             continue
 
     return names
 
 
 def _norm_name(value: str) -> str:
-    """Normalize spaces and periods for name comparison."""
-
     return re.sub(r"[\s.]", "", value or "").upper()
 
 
@@ -303,8 +263,6 @@ def _norm_name(value: str) -> str:
 
 @app.get("/health", tags=["Health"])
 def health():
-    """Check whether the API is running."""
-
     return {
         "status": "ok",
         "time": datetime.now(timezone.utc).isoformat(),
@@ -312,34 +270,14 @@ def health():
 
 
 @app.get("/health/supabase", tags=["Health"])
-@app.get("/debug/student/{student_id}", tags=["Health"])
-def debug_student(student_id: int):
-    """Check whether a student ID is visible to the backend."""
-    try:
-        result = (
-            get_sb()
-            .table("student_identification")
-            .select("student_id")
-            .eq("student_id", student_id)
-            .execute()
-        )
-        return {
-            "requested_student_id": student_id,
-            "found": bool(result.data),
-            "matching_rows": result.data or [],
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Student lookup failed: {type(exc).__name__}",
-        )
 def health_supabase():
-    """Check Supabase configuration, database access, and storage."""
-
+    """Check database and storage connectivity."""
     result = {
         "url_set": bool(SUPABASE_URL),
         "key_set": bool(SUPABASE_KEY),
         "bucket": BUCKET,
+        "database": "not_checked",
+        "storage": "not_checked",
     }
 
     sb = get_sb()
@@ -352,28 +290,48 @@ def health_supabase():
             .execute()
         )
         result["database"] = "ok"
-
     except Exception:
         result["database"] = "error"
 
     try:
         sb.storage.from_(BUCKET).list()
         result["storage"] = "ok"
-
     except Exception:
         result["storage"] = "error"
 
     return result
 
 
+@app.get("/debug/student/{student_id}", tags=["Health"])
+def debug_student(student_id: int):
+    """Temporary diagnostic endpoint."""
+    try:
+        result = (
+            get_sb()
+            .table("student_identification")
+            .select("student_id")
+            .eq("student_id", student_id)
+            .limit(1)
+            .execute()
+        )
+        return {
+            "requested_student_id": student_id,
+            "found": bool(result.data),
+            "matching_rows": result.data or [],
+        }
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Student lookup failed.",
+        )
+
+
 # ---------------------------------------------------------------------------
-# Certificate types
+# Supported certificate types
 # ---------------------------------------------------------------------------
 
 @app.get("/doc-types", tags=["Certificates"])
 def doc_types():
-    """Return supported document types and their table configurations."""
-
     return {
         key: {
             "table": value["table"],
@@ -384,7 +342,7 @@ def doc_types():
 
 
 # ---------------------------------------------------------------------------
-# OCR preview - does not save anything
+# OCR preview - does not save the file or data
 # ---------------------------------------------------------------------------
 
 @app.post("/extract/{doc_type}", tags=["OCR"])
@@ -393,36 +351,61 @@ def extract_only(
     file: UploadFile = File(...),
     student_id: Optional[int] = Form(None),
 ):
-    """Preview OCR and parsed fields without saving the certificate."""
-
     content = read_upload(file)
 
     if doc_type.lower() in ("auto", "detect"):
-        text = extract_text(content, file.filename or "")
-        canonical_type = detect_document_type(text) or "state_board_12th"
-        cfg = get_cfg(canonical_type)
+        try:
+            text = extract_text(content, file.filename or "")
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail="OCR failed. Check the file and OCR configuration.",
+            )
+
+        if not text or not text.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="No readable text was found in this file.",
+            )
+
+        canonical_type = detect_document_type(text)
+
+        if not canonical_type or canonical_type not in DOC_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Could not identify the certificate type. "
+                    "Choose its type manually and try again."
+                ),
+            )
+
         parsed = parse_document(canonical_type, text)
-        fields = parsed.get("fields", parsed) if isinstance(parsed, dict) else {}
+        fields = (
+            parsed.get("fields", parsed)
+            if isinstance(parsed, dict)
+            else {}
+        )
     else:
-        cfg = get_cfg(doc_type)
         canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
+        get_cfg(canonical_type)
         text, fields = run_ocr(
-            canonical_type,
-            content,
-            file.filename or "",
+            canonical_type, content, file.filename or ""
         )
 
-    # Reflect detected standard for State Board marksheets
-    if fields.get("standard") == "11th" and canonical_type == "state_board_12th":
+    if (
+        fields.get("standard") == "11th"
+        and canonical_type == "state_board_12th"
+        and "state_board_11th" in DOC_TYPES
+    ):
         canonical_type = "state_board_11th"
-    elif fields.get("standard") == "12th" and canonical_type == "state_board_11th":
+    elif (
+        fields.get("standard") == "12th"
+        and canonical_type == "state_board_11th"
+        and "state_board_12th" in DOC_TYPES
+    ):
         canonical_type = "state_board_12th"
 
-    warnings = validate_document(
-        canonical_type,
-        fields,
-        text,
-    )
+    warnings = validate_document(canonical_type, fields, text)
 
     candidate_name = (
         fields.get("candidate_name")
@@ -437,8 +420,7 @@ def extract_only(
                 and _norm_name(saved_name) == _norm_name(candidate_name)
             ):
                 warnings.append(
-                    f"Name spelling differs from the saved record: "
-                    f"'{saved_name}' (this sheet reads '{candidate_name}')."
+                    f"Name spelling differs from saved record '{saved_name}'."
                 )
                 break
 
@@ -451,7 +433,7 @@ def extract_only(
 
 
 # ---------------------------------------------------------------------------
-# Upload certificate - stores file and parsed data in Supabase
+# Upload certificate - saves original file and extracted fields
 # ---------------------------------------------------------------------------
 
 @app.post("/upload/{doc_type}", tags=["Certificates"])
@@ -459,21 +441,13 @@ def upload_certificate(
     doc_type: str,
     student_id: int = Form(...),
     file: UploadFile = File(...),
-    overrides: Optional[str] = Form(
-        None,
-        description="JSON containing corrected certificate fields.",
-    ),
+    overrides: Optional[str] = Form(None),
 ):
-    """
-    Validate the student, run OCR, upload the file to Supabase Storage,
-    and insert parsed fields into the configured document table.
-    """
-
     cfg = get_cfg(doc_type)
     canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
     sb = get_sb()
 
-    # Verify that the student exists.
+    # 1. Verify that the student exists.
     try:
         student_result = (
             sb.table("student_identification")
@@ -482,7 +456,6 @@ def upload_certificate(
             .limit(1)
             .execute()
         )
-
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -492,25 +465,21 @@ def upload_certificate(
     if not student_result.data:
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"student_id {student_id} was not found "
-                "in student_identification."
-            ),
+            detail=f"student_id {student_id} was not found.",
         )
 
+    # 2. Read the uploaded file.
     content = read_upload(file)
 
+    # 3. Run OCR and parse the fields.
     text, fields = run_ocr(
-        canonical_type,
-        content,
-        file.filename or "",
+        canonical_type, content, file.filename or ""
     )
 
-    # Apply manually corrected fields if provided.
+    # 4. Apply manually corrected fields, if supplied.
     if overrides:
         try:
             manual_fields = json.loads(overrides)
-
         except json.JSONDecodeError:
             raise HTTPException(
                 status_code=400,
@@ -523,11 +492,7 @@ def upload_certificate(
                 detail="overrides must be a JSON object.",
             )
 
-        unknown_fields = [
-            key for key in manual_fields
-            if key not in fields
-        ]
-
+        unknown_fields = [key for key in manual_fields if key not in fields]
         if unknown_fields:
             raise HTTPException(
                 status_code=400,
@@ -536,14 +501,13 @@ def upload_certificate(
 
         fields.update(manual_fields)
 
+    # 5. Upload the original file to Supabase Storage.
     filename = file.filename or "certificate"
-    ext = os.path.splitext(filename)[1].lower()
-
+    ext = Path(filename).suffix.lower()
     storage_path = (
         f"{canonical_type}/{student_id}/{uuid.uuid4().hex}{ext}"
     )
 
-    # Upload original certificate to Supabase Storage.
     try:
         sb.storage.from_(BUCKET).upload(
             storage_path,
@@ -552,38 +516,31 @@ def upload_certificate(
                 "content-type": (
                     file.content_type or "application/octet-stream"
                 ),
-                "upsert": "true",
+                "upsert": "false",
             },
         )
-
     except Exception:
         raise HTTPException(
             status_code=502,
             detail="Certificate file upload to Supabase Storage failed.",
         )
 
-    # Prepare database row.
+    # 6. Prepare and insert the database row.
     row = {
         key: value
         for key, value in fields.items()
         if value is not None
     }
-
     row["student_id"] = student_id
     row["certificate_file_path"] = storage_path
 
-    if cfg["extracted_text"]:
+    if cfg.get("extracted_text"):
         row["extracted_text"] = mask_sensitive(text)
 
-    # Insert parsed data into the document table.
     try:
-        result = (
-            sb.table(cfg["table"])
-            .insert(row)
-            .execute()
-        )
-
+        result = sb.table(cfg["table"]).insert(row).execute()
     except Exception:
+        # Avoid leaving an orphaned file when the database insert fails.
         try:
             sb.storage.from_(BUCKET).remove([storage_path])
         except Exception:
@@ -592,8 +549,8 @@ def upload_certificate(
         raise HTTPException(
             status_code=400,
             detail=(
-                "Database insert failed. Check the target table "
-                "and column names."
+                "Database insert failed. Check the target table's "
+                "column names, required fields, and data types."
             ),
         )
 
@@ -607,27 +564,11 @@ def upload_certificate(
 
 
 # ---------------------------------------------------------------------------
-# List ALL certificates - NEW ENDPOINT FOR MY CERTIFICATES PAGE
+# List all certificates - My Certificates
 # ---------------------------------------------------------------------------
 
 @app.get("/certificates/", tags=["Certificates"])
 def list_all_certificates():
-    """
-    Return certificates from all document tables configured in DOC_TYPES.
-
-    Response format:
-    {
-        "count": 1,
-        "items": [
-            {
-                "student_id": 1,
-                "doc_type": "community_certificate",
-                "file_url": "..."
-            }
-        ]
-    }
-    """
-
     sb = get_sb()
     all_items = []
 
@@ -635,62 +576,35 @@ def list_all_certificates():
         table_name = cfg["table"]
 
         try:
-            result = (
-                sb.table(table_name)
-                .select("*")
-                .execute()
-            )
-
-            rows = result.data or []
-
-            for row in rows:
-                item = dict(row)
-
-                # Identify which certificate type this row belongs to.
-                item["doc_type"] = doc_type
-
-                # Provide a temporary URL for the uploaded file.
-                item["file_url"] = signed_url(
-                    item.get("certificate_file_path")
-                )
-
-                all_items.append(item)
-
-        except Exception as exc:
+            result = sb.table(table_name).select("*").execute()
+        except Exception:
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Failed to retrieve certificates from "
-                    f"table '{table_name}': {str(exc)}"
-                ),
+                detail=f"Could not retrieve records from '{table_name}'.",
             )
 
-    # Sort newest first if created_at is available.
+        for row in result.data or []:
+            item = dict(row)
+            item["doc_type"] = doc_type
+            item["file_url"] = signed_url(
+                item.get("certificate_file_path")
+            )
+            all_items.append(item)
+
     all_items.sort(
         key=lambda item: str(item.get("created_at") or ""),
         reverse=True,
     )
 
-    return {
-        "count": len(all_items),
-        "items": all_items,
-    }
+    return {"count": len(all_items), "items": all_items}
 
 
 # ---------------------------------------------------------------------------
-# List certificates for a specific student and document type
+# List certificates for one student and type
 # ---------------------------------------------------------------------------
 
-@app.get(
-    "/certificates/{doc_type}/{student_id}",
-    tags=["Certificates"],
-)
-def list_certificates(
-    doc_type: str,
-    student_id: int,
-):
-    """Return saved certificates for the specified student."""
-
+@app.get("/certificates/{doc_type}/{student_id}", tags=["Certificates"])
+def list_certificates(doc_type: str, student_id: int):
     cfg = get_cfg(doc_type)
 
     try:
@@ -702,7 +616,6 @@ def list_certificates(
             .order("created_at", desc=True)
             .execute()
         )
-
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -716,10 +629,7 @@ def list_certificates(
             row.get("certificate_file_path")
         )
 
-    return {
-        "count": len(rows),
-        "items": rows,
-    }
+    return {"count": len(rows), "items": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -731,17 +641,12 @@ class VerifyBody(BaseModel):
     status: str = "verified"
 
 
-@app.patch(
-    "/verify/{doc_type}/{record_id}",
-    tags=["Verification"],
-)
+@app.patch("/verify/{doc_type}/{record_id}", tags=["Verification"])
 def verify_certificate(
     doc_type: str,
     record_id: int,
     body: VerifyBody,
 ):
-    """Update the verification status of a certificate."""
-
     cfg = get_cfg(doc_type)
 
     if not cfg["verification"]:
@@ -760,19 +665,14 @@ def verify_certificate(
         result = (
             get_sb()
             .table(cfg["table"])
-            .update(
-                {
-                    "verification_status": body.status,
-                    "verified_by": body.verified_by,
-                    "verified_at": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
-                }
-            )
+            .update({
+                "verification_status": body.status,
+                "verified_by": body.verified_by,
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+            })
             .eq("id", record_id)
             .execute()
         )
-
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -785,26 +685,15 @@ def verify_certificate(
             detail="Certificate record was not found.",
         )
 
-    return {
-        "updated": True,
-        "record": result.data[0],
-    }
+    return {"updated": True, "record": result.data[0]}
 
 
 # ---------------------------------------------------------------------------
 # Delete certificate
 # ---------------------------------------------------------------------------
 
-@app.delete(
-    "/certificates/{doc_type}/{record_id}",
-    tags=["Certificates"],
-)
-def delete_certificate(
-    doc_type: str,
-    record_id: int,
-):
-    """Delete a certificate record and attempt to remove its stored file."""
-
+@app.delete("/certificates/{doc_type}/{record_id}", tags=["Certificates"])
+def delete_certificate(doc_type: str, record_id: int):
     cfg = get_cfg(doc_type)
     sb = get_sb()
 
@@ -815,7 +704,6 @@ def delete_certificate(
             .eq("id", record_id)
             .execute()
         )
-
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -837,7 +725,6 @@ def delete_certificate(
             .eq("id", record_id)
             .execute()
         )
-
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -848,10 +735,6 @@ def delete_certificate(
         try:
             sb.storage.from_(BUCKET).remove([storage_path])
         except Exception:
-            # The database row is already deleted.
             pass
 
-    return {
-        "deleted": True,
-        "record_id": record_id,
-    }
+    return {"deleted": True, "record_id": record_id}
