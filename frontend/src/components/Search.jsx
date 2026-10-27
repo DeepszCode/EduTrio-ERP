@@ -225,9 +225,9 @@ function mapCertificate(record, index) {
   };
 }
 
-export default function Search({ onBack, supabase, user }) {
-  const [searchText, setSearchText] = useState("");
-  const [submittedQuery, setSubmittedQuery] = useState("");
+export default function Search({ onBack, supabase, user, userRole = "student", initialQuery = "" }) {
+  const [searchText, setSearchText] = useState(initialQuery);
+  const [submittedQuery, setSubmittedQuery] = useState(initialQuery);
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
@@ -263,28 +263,15 @@ export default function Search({ onBack, supabase, user }) {
 
       // Select all existing columns. This avoids errors caused by
       // optional column names that may differ in your Supabase table.
-      const { data, error } = await supabase
+      let query = supabase
         .from("certificates")
         .select("*")
-        .order("created_at", { ascending: false });
+      if (userRole === "student") query = query.eq("student_user_id", currentUser.id);
+      const { data, error } = await query.order("created_at", { ascending: false });
 
       if (error) throw error;
 
-      // RLS should be enabled on the certificates table.
-      // This additional filter also limits records to the current user
-      // when the table has a user_id column.
-      const userRecords = (data || []).filter((record) => {
-        if (
-          Object.prototype.hasOwnProperty.call(record, "user_id") &&
-          record.user_id != null
-        ) {
-          return record.user_id === currentUser.id;
-        }
-
-        return true;
-      });
-
-      setRecords(userRecords.map(mapCertificate));
+      setRecords((data || []).map(mapCertificate));
     } catch (error) {
       console.error("Unable to load certificates:", error);
       setRecords([]);
@@ -294,7 +281,7 @@ export default function Search({ onBack, supabase, user }) {
     } finally {
       setLoading(false);
     }
-  }, [supabase, user]);
+  }, [supabase, user, userRole]);
 
   useEffect(() => {
     loadCertificates();

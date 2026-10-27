@@ -1,10 +1,11 @@
 
-import { useState, useEffect, useCallback } from "react";
-import { createClient } from "@supabase/supabase-js";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { supabase } from "./lib/supabase";
+import { canAccessPage, normalizeRole } from "./auth/roles";
 
 /* MAIN PAGES */
 import WelcomePage from "./components/welcomePage";
-import LoginPage from "./components/LoginPage";
+import LoginPage, { PasswordResetPage } from "./components/LoginPage";
 import Dashboard from "./components/Dashboard";
 
 /* CERTIFICATE CATEGORY AND TYPE */
@@ -25,21 +26,16 @@ import Students from "./components/Students";
 import Search from "./components/Search";
 import Reports from "./components/Reports";
 import AIAssistant from "./components/AIAssistant";
+import { AIAssistantDock } from "./components/AIAssistant";
+import { AIConversationProvider, useAIConversation } from "./components/AIConversationContext";
 import Settings from "./components/Settings";
-
-/* SUPABASE CONFIGURATION */
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-const supabase =
-  supabaseUrl && supabaseKey
-    ? createClient(supabaseUrl, supabaseKey)
-    : null;
+import AdminUsers from "./components/AdminUsers";
 
 /* PAGE CONSTANTS */
 const PAGES = {
   WELCOME: "welcome",
   LOGIN: "login",
+  RESET_PASSWORD: "resetPassword",
   DASHBOARD: "dashboard",
   CERTIFICATE_CATEGORY: "certificateCategory",
   CERTIFICATE_TYPE: "certificateType",
@@ -56,9 +52,26 @@ const PAGES = {
   REPORTS: "reports",
   AI_ASSISTANT: "aiAssistant",
   SETTINGS: "settings",
+  USER_MANAGEMENT: "userManagement",
 };
 
 const VALID_PAGES = new Set(Object.values(PAGES));
+const API_BASE_URL = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+
+function getRequestedPage() {
+  const requested = new URLSearchParams(window.location.search).get("page");
+  return requested && VALID_PAGES.has(requested) && ![PAGES.WELCOME, PAGES.LOGIN].includes(requested)
+    ? requested
+    : null;
+}
+
+function updatePageUrl(page, replace = false) {
+  const url = new URL(window.location.href);
+  if (page === PAGES.WELCOME || page === PAGES.LOGIN) url.searchParams.delete("page");
+  else url.searchParams.set("page", page);
+  if (replace) window.history.replaceState({ smartErpPage: page }, "", url.toString());
+  else window.history.pushState({ smartErpPage: page }, "", url.toString());
+}
 
 /* CERTIFICATE TYPE HELPER */
 const getCertificateType = (certificate, ocrResult) => {
@@ -77,7 +90,16 @@ const getCertificateType = (certificate, ocrResult) => {
 
 /* STUDENT NAME HELPER */
 const getStudentName = (ocrResult) => {
-  const fields = ocrResult?.fields || {};
+  const fields = Array.isArray(ocrResult?.fields)
+    ? Object.fromEntries(
+        ocrResult.fields
+          .filter((field) => field && typeof field === "object")
+          .map((field) => [
+            field.field || field.key || field.name,
+            field.value,
+          ])
+      )
+    : ocrResult?.fields || ocrResult?.data || {};
 
   return (
     fields.student_name ||
@@ -102,16 +124,41 @@ const getCertificateName = (documentData) => {
     : "Certificate";
 };
 
-export default function App() {
+function AppContent() {
+  const { setCompactOpen, resetConversation } = useAIConversation();
   /* APPLICATION STATE */
   const [currentPage, setCurrentPage] = useState(PAGES.WELCOME);
   const [user, setUser] = useState(null);
+  const [assignedRole, setAssignedRole] = useState(null);
+  const [roleError, setRoleError] = useState("");
+  const passwordRecoveryPending = useRef(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [savingCertificate, setSavingCertificate] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const [globalSearchQuery, setGlobalSearchQuery] = useState("");
+  const invitationAcceptancePending = useRef(
+    new URLSearchParams(window.location.search).get("flow") === "student-invite"
+  );
+  const staffRegistrationPending = useRef(
+    new URLSearchParams(window.location.search).get("flow") === "staff-register"
+  );
 
   const [selectedCategory, setSelectedCategory] = useState(null);
   const [selectedCertificate, setSelectedCertificate] = useState(null);
+  const [selectedExtractedType, setSelectedExtractedType] = useState(null);
   const [documentData, setDocumentData] = useState(null);
+
+  const canEnterPage = useCallback((role, page) => {
+    if (!canAccessPage(role, page)) return false;
+    if (page === PAGES.CERTIFICATE_TYPE) return Boolean(selectedCategory);
+    if ([PAGES.CHOOSE_METHOD, PAGES.SCAN_UPLOAD, PAGES.UPLOAD].includes(page)) {
+      return Boolean(selectedCertificate);
+    }
+    if (page === PAGES.PROCESSING) return Boolean(selectedCertificate && documentData);
+    if (page === PAGES.EXTRACTED_DATA) return Boolean(selectedCertificate && documentData?.ocrResult);
+    if (page === PAGES.CERTIFICATE_DATABASE) return Boolean(selectedCertificate && documentData?.ocrResult);
+    return true;
+  }, [selectedCategory, selectedCertificate, documentData]);
 
   /* RESET CERTIFICATE WORKFLOW */
   const resetCertificateData = useCallback(() => {
@@ -134,15 +181,27 @@ export default function App() {
     } = supabase.auth.onAuthStateChange((event, session) => {
       if (!active) return;
 
-      setUser(session?.user ?? null);
-
-      if (event === "SIGNED_IN" && session?.user) {
-        setCurrentPage(PAGES.DASHBOARD);
+      if (event === "SIGNED_IN" || event === "SIGNED_OUT") {
+        resetConversation();
+        setCompactOpen(false);
       }
 
       if (event === "SIGNED_OUT") {
+        setUser(null);
+        setAssignedRole(null);
         resetCertificateData();
         setCurrentPage(PAGES.WELCOME);
+        updatePageUrl(PAGES.WELCOME);
+      }
+
+      if (event === "PASSWORD_RECOVERY" && session?.user) {
+        passwordRecoveryPending.current = true;
+        setUser(session.user);
+        setCurrentPage(PAGES.RESET_PASSWORD);
+      }
+      if (event === "SIGNED_IN" && invitationAcceptancePending.current && session?.user) {
+        setUser(session.user);
+        setCurrentPage(PAGES.RESET_PASSWORD);
       }
     });
 
@@ -161,11 +220,40 @@ export default function App() {
         }
 
         if (session?.user) {
-          setUser(session.user);
-          setCurrentPage(PAGES.DASHBOARD);
+          if (invitationAcceptancePending.current) {
+            setUser(session.user);
+            setCurrentPage(PAGES.RESET_PASSWORD);
+            return;
+          }
+          if (passwordRecoveryPending.current) {
+            setUser(session.user);
+            setCurrentPage(PAGES.RESET_PASSWORD);
+            return;
+          }
+          const expectedRole = staffRegistrationPending.current
+            ? "staff"
+            : window.sessionStorage.getItem("smart-erp-login-role");
+          try {
+            await acceptAuthenticatedUser(session, expectedRole);
+          } catch (roleCheckError) {
+            console.error("Session role verification failed:", roleCheckError);
+            setRoleError(roleCheckError?.message || "Unable to verify your account permissions.");
+            setUser(null);
+            setAssignedRole(null);
+            setCurrentPage(PAGES.LOGIN);
+          }
         } else {
           setUser(null);
-          setCurrentPage(PAGES.WELCOME);
+          setAssignedRole(null);
+          if (invitationAcceptancePending.current) {
+            setRoleError("This Student invitation link is invalid or expired. Ask Staff to send a new invitation.");
+            setCurrentPage(PAGES.LOGIN);
+          } else if (staffRegistrationPending.current) {
+            setRoleError("Confirm your Staff registration email, then sign in again as Staff.");
+            setCurrentPage(PAGES.LOGIN);
+          } else {
+            setCurrentPage(PAGES.WELCOME);
+          }
         }
       } catch (error) {
         console.error("Session error:", error);
@@ -182,7 +270,90 @@ export default function App() {
       active = false;
       subscription.unsubscribe();
     };
-  }, [resetCertificateData]);
+  }, [resetCertificateData, resetConversation, setCompactOpen]);
+
+  useEffect(() => {
+    const handlePageHistory = () => {
+      const requested = getRequestedPage();
+      if (!requested) {
+        setCurrentPage(user ? PAGES.DASHBOARD : PAGES.WELCOME);
+        return;
+      }
+      if (!user) {
+        setCurrentPage(PAGES.LOGIN);
+        return;
+      }
+      const cameFromAppNavigation = window.history.state?.smartErpPage === requested;
+      const page = cameFromAppNavigation && canEnterPage(assignedRole, requested)
+        ? requested
+        : PAGES.DASHBOARD;
+      if (page !== requested) updatePageUrl(page, true);
+      setCurrentPage(page);
+    };
+    window.addEventListener("popstate", handlePageHistory);
+    return () => window.removeEventListener("popstate", handlePageHistory);
+  }, [assignedRole, user, canEnterPage]);
+
+  const acceptAuthenticatedUser = async (sessionOrUser, expectedRole = null) => {
+    const authenticatedUser = sessionOrUser?.user || sessionOrUser;
+    if (!authenticatedUser?.id) throw new Error("Unable to verify your login. Please sign in again.");
+    let { data: roleRecord, error } = await supabase
+      .from("user_roles")
+      .select("role")
+      .eq("user_id", authenticatedUser.id)
+      .maybeSingle();
+    if (error) throw new Error(`Could not verify your assigned role. Apply the account invitation migration and try again. (${error.message})`);
+
+    if (!roleRecord?.role) {
+      const endpoint = expectedRole === "staff"
+        ? "/api/auth/activate-staff"
+        : "/api/invitations/students/accept";
+      const accessToken = sessionOrUser?.access_token || (await supabase.auth.getSession()).data?.session?.access_token;
+      if (!accessToken) throw new Error("Your session is missing. Sign in again to complete account activation.");
+      const activationResponse = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const activationBody = await activationResponse.json().catch(() => ({}));
+      if (!activationResponse.ok) {
+        throw new Error(activationBody.detail || "Your account could not be activated. Check the invitation or Staff approval and try again.");
+      }
+      ({ data: roleRecord, error } = await supabase
+        .from("user_roles")
+        .select("role")
+        .eq("user_id", authenticatedUser.id)
+        .maybeSingle());
+      if (error) throw new Error(`Could not reload the assigned role. (${error.message})`);
+    }
+
+    const trustedRole = normalizeRole(roleRecord?.role);
+    if (!trustedRole) throw new Error("This account has no valid assigned role. Ask an administrator to configure it.");
+    if (expectedRole && normalizeRole(expectedRole) !== trustedRole) {
+      window.sessionStorage.removeItem("smart-erp-login-role");
+      throw new Error(`This account is assigned to ${trustedRole[0].toUpperCase()}${trustedRole.slice(1)}, not ${expectedRole[0].toUpperCase()}${expectedRole.slice(1)}. Choose the assigned role and try again.`);
+    }
+    window.sessionStorage.removeItem("smart-erp-login-role");
+    setRoleError("");
+    setUser(authenticatedUser);
+    setAssignedRole(trustedRole);
+    resetCertificateData();
+    const requestedPage = getRequestedPage();
+    const cameFromAppNavigation = requestedPage
+      && window.history.state?.smartErpPage === requestedPage;
+    const landingPage = cameFromAppNavigation && canEnterPage(trustedRole, requestedPage)
+      ? requestedPage
+      : PAGES.DASHBOARD;
+    if (requestedPage && landingPage !== requestedPage) updatePageUrl(landingPage, true);
+    setCurrentPage(landingPage);
+    passwordRecoveryPending.current = false;
+    if (invitationAcceptancePending.current || staffRegistrationPending.current) {
+      invitationAcceptancePending.current = false;
+      staffRegistrationPending.current = false;
+      const inviteUrl = new URL(window.location.href);
+      inviteUrl.searchParams.delete("flow");
+      window.history.replaceState({}, "", inviteUrl.toString());
+    }
+  };
 
   /* NAVIGATION */
   const navigate = useCallback((page) => {
@@ -191,8 +362,22 @@ export default function App() {
       return;
     }
 
+    if (page !== PAGES.WELCOME && page !== PAGES.LOGIN && (!user || !canAccessPage(assignedRole, page))) {
+      console.warn(`Role ${assignedRole} cannot access page ${page}`);
+      return;
+    }
+
+    setCompactOpen(false);
+    updatePageUrl(page);
     setCurrentPage(page);
-  }, []);
+  }, [assignedRole, setCompactOpen, user]);
+
+  const withAssistantDock = (content) => (
+    <>
+      {content}
+      <AIAssistantDock user={user} currentPage={currentPage} onExpand={() => navigate(PAGES.AI_ASSISTANT)} />
+    </>
+  );
 
   /* START NEW CERTIFICATE WORKFLOW */
   const startCertificateWorkflow = useCallback(() => {
@@ -212,44 +397,31 @@ export default function App() {
 
   /* LOGIN */
   const handleLogin = useCallback(
-    async (sessionOrUser) => {
+    async (sessionOrUser, expectedRole = null) => {
       if (!supabase) {
         alert("Supabase is not configured. Check your .env file.");
         return;
       }
 
       try {
-        let authenticatedUser =
-          sessionOrUser?.user || sessionOrUser || null;
-
-        if (!authenticatedUser?.id) {
-          const {
-            data: { user: currentUser },
-            error,
-          } = await supabase.auth.getUser();
-
-          if (error || !currentUser?.id) {
-            alert("Unable to verify your login. Please try again.");
-            return;
-          }
-
-          authenticatedUser = currentUser;
-        }
-
-        setUser(authenticatedUser);
-        resetCertificateData();
-        navigate(PAGES.DASHBOARD);
+        await acceptAuthenticatedUser(sessionOrUser, expectedRole);
+        return true;
       } catch (error) {
         console.error("Login failed:", error);
-        alert("Login failed. Please try again.");
+        setRoleError(error?.message || "Unable to verify your login. Please try again.");
+        setUser(null);
+        setAssignedRole(null);
+        setCurrentPage(PAGES.LOGIN);
+        return false;
       }
     },
-    [navigate, resetCertificateData]
+    [resetCertificateData, canEnterPage]
   );
 
   /* LOGOUT */
   const handleLogout = useCallback(async () => {
     if (!supabase) return;
+    setSigningOut(true);
 
     try {
       const { error } = await supabase.auth.signOut();
@@ -261,11 +433,14 @@ export default function App() {
       }
 
       setUser(null);
+      setAssignedRole(null);
       resetCertificateData();
       navigate(PAGES.WELCOME);
     } catch (error) {
       console.error("Logout error:", error);
       alert("Unable to log out. Please try again.");
+    } finally {
+      setSigningOut(false);
     }
   }, [navigate, resetCertificateData]);
 
@@ -431,25 +606,36 @@ export default function App() {
       <LoginPage
         onLogin={handleLogin}
         onBack={goHome}
+        authError={roleError}
       />
     );
   }
 
+  if (currentPage === PAGES.RESET_PASSWORD) {
+    return <PasswordResetPage invitation={invitationAcceptancePending.current} onComplete={handleLogin} onBack={() => navigate(PAGES.LOGIN)} />;
+  }
+
   /* DASHBOARD */
   if (currentPage === PAGES.DASHBOARD) {
-    return (
+    return withAssistantDock(
       <Dashboard
         user={user}
+        userRole={assignedRole}
         onNavigate={navigate}
         onUpload={startCertificateWorkflow}
         onLogout={handleLogout}
+        logoutLoading={signingOut}
+        onGlobalSearch={(query) => {
+          setGlobalSearchQuery(query);
+          navigate(PAGES.SEARCH);
+        }}
       />
     );
   }
 
   /* CERTIFICATE CATEGORY */
   if (currentPage === PAGES.CERTIFICATE_CATEGORY) {
-    return (
+    return withAssistantDock(
       <CertificateCategory
         onBack={goDashboard}
         onHome={goHome}
@@ -461,7 +647,7 @@ export default function App() {
 
   /* CERTIFICATE TYPE */
   if (currentPage === PAGES.CERTIFICATE_TYPE) {
-    return (
+    return withAssistantDock(
       <CertificateType
         certificate={selectedCategory}
         onBack={() => navigate(PAGES.CERTIFICATE_CATEGORY)}
@@ -473,7 +659,7 @@ export default function App() {
 
   /* CHOOSE SCAN OR UPLOAD */
   if (currentPage === PAGES.CHOOSE_METHOD) {
-    return (
+    return withAssistantDock(
       <ChooseMethod
         certificate={selectedCertificate}
         onBack={() => navigate(PAGES.CERTIFICATE_TYPE)}
@@ -497,7 +683,7 @@ export default function App() {
 
   /* CAMERA / SCAN */
   if (currentPage === PAGES.SCAN_UPLOAD) {
-    return (
+    return withAssistantDock(
       <ScanUpload
         certificate={selectedCertificate}
         onBack={() => navigate(PAGES.CHOOSE_METHOD)}
@@ -521,7 +707,7 @@ export default function App() {
 
   /* FILE UPLOAD */
   if (currentPage === PAGES.UPLOAD) {
-    return (
+    return withAssistantDock(
       <UploadPage
         certificate={selectedCertificate}
         onBack={() => navigate(PAGES.CHOOSE_METHOD)}
@@ -545,10 +731,11 @@ export default function App() {
 
   /* OCR PROCESSING */
   if (currentPage === PAGES.PROCESSING) {
-    return (
+    return withAssistantDock(
       <Processing
         certificate={selectedCertificate}
         documentData={documentData}
+        supabase={supabase}
         onBack={() =>
           navigate(
             documentData?.source === "upload"
@@ -576,7 +763,7 @@ export default function App() {
 
   /* EXTRACTED CERTIFICATE REVIEW */
   if (currentPage === PAGES.EXTRACTED_DATA) {
-    return (
+    return withAssistantDock(
       <ExtractedData
         certificate={selectedCertificate}
         documentData={documentData}
@@ -596,10 +783,11 @@ export default function App() {
 
   /* CERTIFICATE DATABASE */
   if (currentPage === PAGES.CERTIFICATE_DATABASE) {
-    return (
+    return withAssistantDock(
       <CertificateDatabase
         supabase={supabase}
         user={user}
+        userRole={assignedRole}
         documentData={documentData}
         certificate={selectedCertificate}
         onBack={() => navigate(PAGES.EXTRACTED_DATA)}
@@ -609,26 +797,51 @@ export default function App() {
   }
 
   /* DASHBOARD MENU PAGES */
+  if (currentPage === PAGES.AI_ASSISTANT) {
+    return (
+      <AIAssistant
+        onBack={goDashboard}
+        onReturnToSmall={() => {
+          goDashboard();
+          setCompactOpen(true);
+        }}
+      />
+    );
+  }
+
   const menuPages = {
     [PAGES.EXTRACTED_DATA_MENU]: CertificateDatabase,
     [PAGES.MY_CERTIFICATES]: MyCertificates,
     [PAGES.STUDENTS]: Students,
     [PAGES.SEARCH]: Search,
     [PAGES.REPORTS]: Reports,
-    [PAGES.AI_ASSISTANT]: AIAssistant,
     [PAGES.SETTINGS]: Settings,
+    [PAGES.USER_MANAGEMENT]: AdminUsers,
   };
 
   const PageComponent = menuPages[currentPage];
 
   if (PageComponent) {
-    return (
+    return withAssistantDock(
       <PageComponent
         supabase={supabase}
         user={user}
+        userRole={assignedRole}
         documentData={documentData}
         certificate={selectedCertificate}
-        onBack={goDashboard}
+        selectedType={currentPage === PAGES.EXTRACTED_DATA_MENU ? selectedExtractedType : undefined}
+        onSelectType={currentPage === PAGES.EXTRACTED_DATA_MENU ? setSelectedExtractedType : undefined}
+        initialQuery={currentPage === PAGES.SEARCH ? globalSearchQuery : ""}
+        onGlobalSearch={(query) => {
+          setGlobalSearchQuery(query);
+          navigate(PAGES.SEARCH);
+        }}
+        onLogout={handleLogout}
+        logoutLoading={signingOut}
+        onBack={() => {
+          if (currentPage === PAGES.EXTRACTED_DATA_MENU) setSelectedExtractedType(null);
+          goDashboard();
+        }}
         onNavigate={navigate}
       />
     );
@@ -636,4 +849,12 @@ export default function App() {
 
   /* FALLBACK */
   return <WelcomePage onStart={() => navigate(PAGES.LOGIN)} />;
+}
+
+export default function App() {
+  return (
+    <AIConversationProvider>
+      <AppContent />
+    </AIConversationProvider>
+  );
 }

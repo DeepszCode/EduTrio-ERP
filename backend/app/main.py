@@ -11,6 +11,7 @@ API docs:
 """
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -19,7 +20,9 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
@@ -34,7 +37,10 @@ from app.ocr_service import (
     validate_document,
     detect_document_type,
 )
+from app.ocr_engine import extract_document
 from app.ai_routes import router as ai_router
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +54,8 @@ SUPABASE_KEY = (
     or os.getenv("SUPABASE_KEY")
     or ""
 ).strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+SMART_ERP_FRONTEND_URL = (os.getenv("SMART_ERP_FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/")
 
 BUCKET = (
     os.getenv("SUPABASE_STORAGE_BUCKET")
@@ -56,6 +64,7 @@ BUCKET = (
 ).strip()
 
 MAX_FILE_MB = 10
+MAX_BATCH_FILES = 30
 
 ALLOWED_EXT = {
     ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"
@@ -90,14 +99,66 @@ app.include_router(ai_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
+    allow_origins=list(dict.fromkeys([
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-    ],
+        SMART_ERP_FRONTEND_URL,
+    ])),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_api_role(request: Request, call_next):
+    """Protect all service-role-backed endpoints with a verified user role."""
+    path = request.url.path
+    if request.method == "OPTIONS" or path in {"/health", "/doc-types", "/openapi.json", "/docs", "/redoc"}:
+        return await call_next(request)
+
+    # These endpoints establish roles only after independently validating the
+    # Supabase Auth user, invitation/allowlist state, and email confirmation.
+    if path in {"/api/auth/activate-staff", "/api/invitations/students/accept"}:
+        return await call_next(request)
+
+    # The AI router performs token verification itself and applies role checks
+    # before any cross-student legacy lookup.
+    if path.startswith("/api/ai/"):
+        return await call_next(request)
+
+    # Diagnostic endpoints reveal administrative data and are Admin-only.
+    admin_only = path.startswith("/debug/") or path.startswith("/api/admin/") or path == "/health/supabase" or (
+        request.method == "DELETE" and path.startswith("/certificates/")
+    )
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token.strip():
+        return JSONResponse(status_code=401, content={"detail": "Sign in to use this endpoint."})
+
+    try:
+        sb = get_sb()
+        auth_result = await run_in_threadpool(sb.auth.get_user, token.strip())
+        authenticated_user = getattr(auth_result, "user", None)
+        if not authenticated_user or not authenticated_user.id:
+            return JSONResponse(status_code=401, content={"detail": "Your session is invalid or expired."})
+        role_result = await run_in_threadpool(
+            lambda: sb.table("user_roles").select("role").eq("user_id", str(authenticated_user.id)).maybe_single().execute()
+        )
+        role = (role_result.data or {}).get("role")
+    except Exception:
+        return JSONResponse(status_code=503, content={"detail": "Unable to verify your account role."})
+
+    if role not in {"admin", "staff", "student"}:
+        return JSONResponse(status_code=403, content={"detail": "Your account has no authorized role."})
+    if role == "student":
+        return JSONResponse(status_code=403, content={"detail": "This endpoint is available to Staff and Admin accounts."})
+    if admin_only and role != "admin":
+        return JSONResponse(status_code=403, content={"detail": "This action requires an Admin account."})
+
+    request.state.user_id = str(authenticated_user.id)
+    request.state.user_role = role
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +166,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 _sb: Optional[Client] = None
+_admin_sb: Optional[Client] = None
 
 
 def get_sb() -> Client:
@@ -130,6 +192,39 @@ def get_sb() -> Client:
             )
 
     return _sb
+
+
+def get_admin_sb() -> Client:
+    """Return the server-only Supabase client used for Auth Admin operations."""
+    global _admin_sb
+    if _admin_sb is None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            raise HTTPException(
+                status_code=503,
+                detail="Admin management and invitations require SUPABASE_SERVICE_ROLE_KEY in backend/.env.",
+            )
+        try:
+            _admin_sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Could not initialize the server-side Supabase Auth client.") from exc
+    return _admin_sb
+
+
+async def get_verified_request_user(request: Request):
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    try:
+        auth_result = await run_in_threadpool(get_admin_sb().auth.get_user, token.strip())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Your Supabase session is invalid or expired.") from exc
+    user = getattr(auth_result, "user", None)
+    if not user or not getattr(user, "id", None) or not getattr(user, "email", None):
+        raise HTTPException(status_code=401, detail="Your Supabase session has no verified account identity.")
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +425,327 @@ def debug_student(student_id: int):
 # Supported certificate types
 # ---------------------------------------------------------------------------
 
+class StudentInvitationRequest(BaseModel):
+    email: str
+
+
+class AdminRoleUpdate(BaseModel):
+    role: str
+
+
+class StaffApprovalRequest(BaseModel):
+    email: str
+
+
+def require_admin(request: Request):
+    if getattr(request.state, "user_role", None) != "admin":
+        raise HTTPException(status_code=403, detail="This action requires an Admin account.")
+
+
+@app.get("/api/admin/users", tags=["Administration"])
+async def admin_list_users(request: Request):
+    require_admin(request)
+    try:
+        result = await run_in_threadpool(
+            lambda: get_admin_sb().table("user_roles")
+            .select("id,user_id,role,created_at,updated_at")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return {"users": result.data or []}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Admin could not list assigned user roles (%s)", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Could not load user roles.") from exc
+
+
+@app.patch("/api/admin/users/{user_id}/role", tags=["Administration"])
+async def admin_update_user_role(user_id: str, payload: AdminRoleUpdate, request: Request):
+    require_admin(request)
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
+        raise HTTPException(status_code=422, detail="Invalid user ID.")
+    role = payload.role.strip().lower()
+    if role not in {"admin", "staff", "student"}:
+        raise HTTPException(status_code=422, detail="Role must be Admin, Staff, or Student.")
+    if user_id.lower() == str(request.state.user_id).lower() and role != "admin":
+        raise HTTPException(status_code=409, detail="You cannot remove your own Admin access.")
+    try:
+        target = await run_in_threadpool(
+            lambda: get_admin_sb().auth.admin.get_user_by_id(user_id)
+        )
+        if not getattr(target, "user", None):
+            raise HTTPException(status_code=404, detail="Auth user was not found.")
+        result = await run_in_threadpool(
+            lambda: get_admin_sb().rpc(
+                "assign_user_role",
+                {"target_user_id": user_id, "new_role": role},
+            ).execute()
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.info("Admin role update rejected", exc_info=True)
+        raise HTTPException(status_code=403, detail="Role update was rejected. Admin assignment is limited to the three approved accounts.") from exc
+    return {"user_id": user_id, "role": role, "updated": True, "result": result.data}
+
+
+@app.get("/api/admin/staff-approvals", tags=["Administration"])
+async def admin_list_staff_approvals(request: Request):
+    require_admin(request)
+    try:
+        result = await run_in_threadpool(
+            lambda: get_admin_sb().table("staff_registration_allowlist")
+            .select("email,enabled,added_by,created_at")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return {"approvals": result.data or []}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Admin could not list Staff approvals (%s)", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Could not load Staff approvals.") from exc
+
+
+@app.post("/api/admin/staff-approvals", tags=["Administration"])
+async def admin_approve_staff(payload: StaffApprovalRequest, request: Request):
+    require_admin(request)
+    email = payload.email.strip().lower()
+    if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid Staff email address.")
+    try:
+        result = await run_in_threadpool(
+            lambda: get_admin_sb().table("staff_registration_allowlist")
+            .upsert({"email": email, "enabled": True, "added_by": request.state.user_id}, on_conflict="email")
+            .execute()
+        )
+        return {"email": email, "enabled": True, "approval": (result.data or [None])[0]}
+    except Exception as exc:
+        logger.exception("Admin could not approve Staff registration")
+        raise HTTPException(status_code=503, detail="Could not save Staff approval.") from exc
+
+
+@app.delete("/api/admin/staff-approvals/{email}", tags=["Administration"])
+async def admin_revoke_staff_approval(email: str, request: Request):
+    require_admin(request)
+    normalized_email = email.strip().lower()
+    try:
+        result = await run_in_threadpool(
+            lambda: get_admin_sb().table("staff_registration_allowlist")
+            .update({"enabled": False})
+            .eq("email", normalized_email)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Staff approval not found.")
+        return {"email": normalized_email, "enabled": False}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Admin could not revoke Staff approval")
+        raise HTTPException(status_code=503, detail="Could not revoke Staff approval.") from exc
+
+
+@app.post("/api/invitations/students", tags=["Invitations"])
+async def invite_student(payload: StudentInvitationRequest, request: Request):
+    """Create an expiring invitation and send the Supabase Auth invite email."""
+    if getattr(request.state, "user_role", None) not in {"admin", "staff"}:
+        raise HTTPException(status_code=403, detail="Only Staff or Admin accounts can invite students.")
+
+    email = payload.email.strip().lower()
+    if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid student email address.")
+
+    admin_sb = get_admin_sb()
+    try:
+        await run_in_threadpool(
+            lambda: admin_sb.table("student_invitations")
+            .update({"status": "expired"})
+            .eq("email", email)
+            .eq("status", "pending")
+            .lt("expires_at", datetime.now(timezone.utc).isoformat())
+            .execute()
+        )
+        inserted = await run_in_threadpool(
+            lambda: admin_sb.table("student_invitations").insert({
+                "email": email,
+                "invited_by": request.state.user_id,
+                "status": "pending",
+            }).select("id,email,status,expires_at").execute()
+        )
+        invitation = (inserted.data or [None])[0]
+        if not invitation:
+            raise RuntimeError("The invitation row was not returned.")
+    except Exception as exc:
+        logger.info("Could not create student invitation", exc_info=True)
+        raise HTTPException(
+            status_code=409,
+            detail="An active invitation may already exist for this email, or the invitation table migration is not applied.",
+        ) from exc
+
+    try:
+        invite_result = await run_in_threadpool(
+            lambda: admin_sb.auth.admin.invite_user_by_email(
+                email,
+                {"redirect_to": f"{SMART_ERP_FRONTEND_URL}/?flow=student-invite"},
+            )
+        )
+        invited_user = getattr(invite_result, "user", None)
+        if not invited_user:
+            raise RuntimeError("Supabase Auth did not return the invited user.")
+    except Exception as exc:
+        logger.info("Supabase Auth student invite failed", exc_info=True)
+        try:
+            await run_in_threadpool(
+                lambda: admin_sb.table("student_invitations")
+                .update({"status": "failed"})
+                .eq("id", invitation["id"])
+                .execute()
+            )
+        except Exception:
+            logger.exception("Could not mark failed student invitation")
+        raise HTTPException(status_code=502, detail="Supabase could not send the invitation email. Check Auth email settings and the backend service key.") from exc
+
+    try:
+        await run_in_threadpool(
+            lambda: admin_sb.table("student_invitations")
+            .update({"auth_invitation_sent_at": datetime.now(timezone.utc).isoformat()})
+            .eq("id", invitation["id"])
+            .execute()
+        )
+    except Exception:
+        # Email delivery succeeded and the pending row remains usable. This
+        # audit timestamp is useful, but it must not invalidate the invite.
+        logger.exception("Invitation was sent but its sent timestamp could not be saved")
+
+    return {
+        "invitation_id": invitation["id"],
+        "email": email,
+        "status": "pending",
+        "expires_at": invitation.get("expires_at"),
+        "message": "Invitation email sent. The student must open it and set a password before access is enabled.",
+    }
+
+
+@app.get("/api/invitations/students", tags=["Invitations"])
+async def list_student_invitations(request: Request):
+    """List all invitations for Admin, or only the caller's invitations for Staff."""
+    role = getattr(request.state, "user_role", None)
+    if role not in {"admin", "staff"}:
+        raise HTTPException(status_code=403, detail="Only Staff or Admin accounts can view student invitations.")
+    try:
+        query = get_admin_sb().table("student_invitations").select(
+            "id,email,invited_by,status,created_at,expires_at,accepted_at,revoked_at,auth_invitation_sent_at"
+        )
+        if role != "admin":
+            query = query.eq("invited_by", request.state.user_id)
+        result = await run_in_threadpool(
+            lambda: query.order("created_at", desc=True).limit(200).execute()
+        )
+        return {"invitations": result.data or []}
+    except Exception as exc:
+        logger.exception("Could not list student invitations")
+        raise HTTPException(status_code=503, detail="Could not load student invitations.") from exc
+
+
+@app.post("/api/auth/activate-staff", tags=["Authentication"])
+async def activate_staff_account(request: Request):
+    """Assign Staff only to an email approved in the server-owned allowlist."""
+    user = await get_verified_request_user(request)
+    email = str(user.email).strip().lower()
+    if not getattr(user, "email_confirmed_at", None):
+        raise HTTPException(status_code=403, detail="Confirm your email before Staff access is activated.")
+
+    admin_sb = get_admin_sb()
+    try:
+        approval = await run_in_threadpool(
+            lambda: admin_sb.table("staff_registration_allowlist")
+            .select("email")
+            .eq("email", email)
+            .eq("enabled", True)
+            .maybe_single()
+            .execute()
+        )
+        if not approval.data:
+            raise HTTPException(status_code=403, detail="This email is not approved for Staff registration. Ask an Admin to approve it.")
+
+        current = await run_in_threadpool(
+            lambda: admin_sb.table("user_roles").select("role").eq("user_id", str(user.id)).maybe_single().execute()
+        )
+        if current.data and current.data.get("role") != "staff":
+            raise HTTPException(status_code=403, detail="This account already has a different role. Contact an Admin.")
+        await run_in_threadpool(
+            lambda: admin_sb.table("user_roles")
+            .upsert({"user_id": str(user.id), "role": "staff", "updated_at": datetime.now(timezone.utc).isoformat()}, on_conflict="user_id")
+            .execute()
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Staff role activation failed")
+        raise HTTPException(status_code=503, detail="Could not verify Staff approval. Check the role migration and server configuration.") from exc
+
+    return {"role": "staff", "message": "Staff access is active."}
+
+
+@app.post("/api/invitations/students/accept", tags=["Invitations"])
+async def accept_student_invitation(request: Request):
+    """Atomically accept one live invite for the signed-in, verified email."""
+    user = await get_verified_request_user(request)
+    email = str(user.email).strip().lower()
+    if not getattr(user, "email_confirmed_at", None):
+        raise HTTPException(status_code=403, detail="Verify the invited email address before accepting the invitation.")
+
+    try:
+        result = await run_in_threadpool(
+            lambda: get_admin_sb().rpc(
+                "accept_student_invitation",
+                {"target_user_id": str(user.id), "verified_email": email},
+            ).execute()
+        )
+    except Exception as exc:
+        logger.info("Student invitation acceptance rejected", exc_info=True)
+        raise HTTPException(status_code=403, detail="This invitation is missing, expired, revoked, already used, or does not match the verified email.") from exc
+
+    return {"role": "student", "invitation_id": result.data, "message": "Invitation accepted."}
+
+
+@app.post("/api/invitations/students/{invitation_id}/revoke", tags=["Invitations"])
+async def revoke_student_invitation(invitation_id: int, request: Request):
+    """Allow the inviter or an Admin to revoke an unused invitation."""
+    if getattr(request.state, "user_role", None) not in {"admin", "staff"}:
+        raise HTTPException(status_code=403, detail="Only Staff or Admin accounts can revoke invitations.")
+    admin_sb = get_admin_sb()
+    try:
+        lookup = await run_in_threadpool(
+            lambda: admin_sb.table("student_invitations").select("id,invited_by,status").eq("id", invitation_id).maybe_single().execute()
+        )
+        row = lookup.data
+        if not row:
+            raise HTTPException(status_code=404, detail="Invitation not found.")
+        if request.state.user_role != "admin" and str(row.get("invited_by")) != str(request.state.user_id):
+            raise HTTPException(status_code=403, detail="You can revoke only invitations you sent.")
+        if row.get("status") != "pending":
+            raise HTTPException(status_code=409, detail="Only a pending invitation can be revoked.")
+        revoked = await run_in_threadpool(
+            lambda: admin_sb.table("student_invitations")
+            .update({"status": "revoked", "revoked_at": datetime.now(timezone.utc).isoformat()})
+            .eq("id", invitation_id)
+            .eq("status", "pending")
+            .select("id")
+            .execute()
+        )
+        if not revoked.data:
+            raise HTTPException(status_code=409, detail="The invitation was accepted or changed before it could be revoked.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Invitation revocation failed")
+        raise HTTPException(status_code=503, detail="Could not update the invitation status.") from exc
+    return {"invitation_id": invitation_id, "status": "revoked"}
+
+
 @app.get("/doc-types", tags=["Certificates"])
 def doc_types():
     return {
@@ -339,7 +755,6 @@ def doc_types():
         }
         for key, value in DOC_TYPES.items()
     }
-
 
 # ---------------------------------------------------------------------------
 # OCR preview - does not save the file or data
@@ -352,66 +767,15 @@ def extract_only(
     student_id: Optional[int] = Form(None),
 ):
     content = read_upload(file)
+    try:
+        result = extract_document(content, file.filename or "document", doc_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=422, detail="OCR failed. Check that Tesseract and the required language data are installed, then try a clearer image or PDF.")
 
-    if doc_type.lower() in ("auto", "detect"):
-        try:
-            text = extract_text(content, file.filename or "")
-        except Exception:
-            raise HTTPException(
-                status_code=422,
-                detail="OCR failed. Check the file and OCR configuration.",
-            )
-
-        if not text or not text.strip():
-            raise HTTPException(
-                status_code=422,
-                detail="No readable text was found in this file.",
-            )
-
-        canonical_type = detect_document_type(text)
-
-        if not canonical_type or canonical_type not in DOC_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Could not identify the certificate type. "
-                    "Choose its type manually and try again."
-                ),
-            )
-
-        parsed = parse_document(canonical_type, text)
-        fields = (
-            parsed.get("fields", parsed)
-            if isinstance(parsed, dict)
-            else {}
-        )
-    else:
-        canonical_type = DOC_TYPE_ALIASES.get(doc_type, doc_type)
-        get_cfg(canonical_type)
-        text, fields = run_ocr(
-            canonical_type, content, file.filename or ""
-        )
-
-    if (
-        fields.get("standard") == "11th"
-        and canonical_type == "state_board_12th"
-        and "state_board_11th" in DOC_TYPES
-    ):
-        canonical_type = "state_board_11th"
-    elif (
-        fields.get("standard") == "12th"
-        and canonical_type == "state_board_11th"
-        and "state_board_12th" in DOC_TYPES
-    ):
-        canonical_type = "state_board_12th"
-
-    warnings = validate_document(canonical_type, fields, text)
-
-    candidate_name = (
-        fields.get("candidate_name")
-        or fields.get("student_name")
-        or fields.get("name_on_card")
-    )
+    fields = result["data"]
+    candidate_name = fields.get("candidate_name") or fields.get("student_name") or fields.get("name_on_card")
 
     if student_id and candidate_name:
         for saved_name in known_names(student_id):
@@ -419,16 +783,80 @@ def extract_only(
                 saved_name != candidate_name
                 and _norm_name(saved_name) == _norm_name(candidate_name)
             ):
-                warnings.append(
+                result["warnings"].append(
                     f"Name spelling differs from saved record '{saved_name}'."
                 )
                 break
+    if result["warnings"]:
+        result["status"] = "review_required"
+    result["doc_type"] = result["certificate_type"]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Batch OCR preview for multiple students and certificate types
+# ---------------------------------------------------------------------------
+
+@app.post("/batch-extract", tags=["OCR"])
+async def batch_extract(
+    files: list[UploadFile] = File(...),
+    students: list[str] = Form(...),
+    doc_types: list[str] = Form(...),
+):
+    """Extract a group of certificates, associating each file to its student.
+
+    Send repeated multipart values in the same order: files, students, doc_types.
+    Use `auto` as a doc_type to identify each certificate from its contents.
+    This endpoint previews data and does not save or verify database records.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload at least one file.")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"A maximum of {MAX_BATCH_FILES} files is allowed per request.")
+    if not (len(files) == len(students) == len(doc_types)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Received {len(files)} files, {len(students)} students, and {len(doc_types)} document types; these lists must have the same length and order.",
+        )
+
+    grouped: dict[str, list[dict]] = {}
+    succeeded = failed = 0
+    for uploaded, student, doc_type in zip(files, students, doc_types):
+        filename = uploaded.filename or "document"
+        student = (student or "").strip()
+        entry = {"filename": filename, "student_id": student or None}
+        try:
+            if not student:
+                raise ValueError("A student identifier is required for every file.")
+            content = await uploaded.read(MAX_FILE_MB * 1024 * 1024 + 1)
+            ext = Path(filename).suffix.lower()
+            if ext not in ALLOWED_EXT:
+                raise ValueError(f"Unsupported file extension: '{ext}'.")
+            if not content:
+                raise ValueError("Uploaded file is empty.")
+            if len(content) > MAX_FILE_MB * 1024 * 1024:
+                raise ValueError(f"File exceeds the {MAX_FILE_MB} MB limit.")
+            result = await run_in_threadpool(
+                extract_document, content, filename, (doc_type or "auto").strip()
+            )
+            entry.update(result)
+            entry["status"] = result.get("status", "review_required")
+            succeeded += 1
+        except ValueError as exc:
+            entry.update({"status": "failed", "error": str(exc)})
+            failed += 1
+        except Exception:
+            entry.update({"status": "failed", "error": "OCR failed for this file. Check the file and OCR configuration."})
+            failed += 1
+        finally:
+            await uploaded.close()
+        grouped.setdefault(student or "unassigned", []).append(entry)
 
     return {
-        "doc_type": canonical_type,
-        "fields": fields,
-        "warnings": warnings,
-        "extracted_text": mask_sensitive(text),
+        "total": len(files),
+        "succeeded": succeeded,
+        "failed": failed,
+        "students": grouped,
     }
 
 

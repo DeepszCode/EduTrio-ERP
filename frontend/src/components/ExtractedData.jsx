@@ -8,8 +8,27 @@ const formatLabel = (key) =>
     .replace(/([a-z])([A-Z])/g, "$1 $2")
     .replace(/\b\w/g, (char) => char.toUpperCase());
 
+const readableFieldLabel = (key, label) => {
+  const providedLabel = String(label || "").trim();
+  if (providedLabel && !/^field\s*\d+$/i.test(providedLabel)) return providedLabel;
+  if (/^field[_\s-]*\d+$/i.test(String(key))) return "Unlabeled field";
+  return formatLabel(key);
+};
+
 const isObject = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
+
+const hasExtractedValue = (value) =>
+  value !== null &&
+  value !== undefined &&
+  !(typeof value === "string" && value.trim() === "");
+
+const omitEmptyFields = (value) =>
+  Object.fromEntries(
+    Object.entries(value || {}).filter(([, fieldValue]) =>
+      hasExtractedValue(fieldValue)
+    )
+  );
 
 function getCertificateType(certificate, result) {
   if (typeof certificate === "string") return certificate;
@@ -79,24 +98,27 @@ function getInitialFields(result) {
   if (!result) return {};
 
   if (isObject(result.fields)) {
-    return { ...result.fields };
+    return omitEmptyFields(result.fields);
   }
 
   if (Array.isArray(result.fields)) {
     return Object.fromEntries(
-      result.fields.map((field, index) => [
-        field.key || field.name || `field_${index + 1}`,
-        field.value ?? "",
-      ])
+      result.fields
+        .filter((field) => field && typeof field === "object")
+        .filter((field) => hasExtractedValue(field.value))
+        .map((field, index) => [
+          field.field || field.key || field.name || `field_${index + 1}`,
+          field.value ?? "",
+        ])
     );
   }
 
   if (isObject(result.extracted_fields)) {
-    return { ...result.extracted_fields };
+    return omitEmptyFields(result.extracted_fields);
   }
 
   if (isObject(result.data)) {
-    return { ...result.data };
+    return omitEmptyFields(result.data);
   }
 
   const ignoredKeys = new Set([
@@ -128,7 +150,10 @@ export default function ExtractedData({
   onNavigate,
   saving = false,
 }) {
-  const ocrResult = documentData?.ocrResult || {};
+  const ocrResult = useMemo(
+    () => documentData?.ocrResult || {},
+    [documentData?.ocrResult]
+  );
 
   const certificateType = getCertificateType(
     certificate,
@@ -147,8 +172,21 @@ export default function ExtractedData({
     () => getInitialFields(ocrResult),
     [ocrResult]
   );
+  const fieldLabels = useMemo(() => {
+    if (!Array.isArray(ocrResult?.fields)) return {};
+    return Object.fromEntries(
+      ocrResult.fields
+        .filter((field) => field && typeof field === "object")
+        .map((field, index) => {
+          const key = field.field || field.key || field.name || `field_${index + 1}`;
+          return [key, readableFieldLabel(key, field.label)];
+        })
+    );
+  }, [ocrResult]);
 
   useEffect(() => {
+    // Reset editable values whenever a new OCR response is supplied.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEditedFields({ ...initialFields });
     setEditingKey(null);
     setFeedback("");
@@ -175,7 +213,8 @@ export default function ExtractedData({
   const fileName = getFileName(documentData);
 
   const fields = Object.entries(editedFields).filter(
-    ([key]) =>
+    ([key, value]) =>
+      hasExtractedValue(value) &&
       ![
         "raw_text",
         "text",
@@ -188,47 +227,50 @@ export default function ExtractedData({
     if (Array.isArray(ocrResult?.fields)) {
       const updatedArray = ocrResult.fields.map((field, index) => {
         const key =
-          field.key || field.name || `field_${index + 1}`;
+          field.field || field.key || field.name || `field_${index + 1}`;
 
         return {
           ...field,
           value: editedFields[key] ?? field.value ?? "",
         };
-      });
+      }).filter((field) => hasExtractedValue(field.value));
 
       return {
         ...ocrResult,
         fields: updatedArray,
+        ...(isObject(ocrResult.data)
+          ? { data: omitEmptyFields({ ...ocrResult.data, ...editedFields }) }
+          : {}),
       };
     }
 
     if (isObject(ocrResult?.fields)) {
       return {
         ...ocrResult,
-        fields: { ...ocrResult.fields, ...editedFields },
+        fields: omitEmptyFields({ ...ocrResult.fields, ...editedFields }),
       };
     }
 
     if (isObject(ocrResult?.extracted_fields)) {
       return {
         ...ocrResult,
-        extracted_fields: {
+        extracted_fields: omitEmptyFields({
           ...ocrResult.extracted_fields,
           ...editedFields,
-        },
+        }),
       };
     }
 
     if (isObject(ocrResult?.data)) {
       return {
         ...ocrResult,
-        data: { ...ocrResult.data, ...editedFields },
+        data: omitEmptyFields({ ...ocrResult.data, ...editedFields }),
       };
     }
 
     return {
       ...ocrResult,
-      fields: { ...editedFields },
+      fields: omitEmptyFields(editedFields),
     };
   }, [ocrResult, editedFields]);
 
@@ -528,7 +570,7 @@ export default function ExtractedData({
                       {fields.map(([key, value]) => (
                         <tr key={key}>
                           <td className="extracted-field-label">
-                            {formatLabel(key)}
+                            {fieldLabels[key] || readableFieldLabel(key)}
                           </td>
 
                           <td className="extracted-field-value">
@@ -544,7 +586,7 @@ export default function ExtractedData({
                                   updateField(key, event.target.value)
                                 }
                                 autoFocus
-                                aria-label={`Edit ${formatLabel(key)}`}
+                                aria-label={`Edit ${fieldLabels[key] || readableFieldLabel(key)}`}
                               />
                             ) : (
                               String(value ?? "") || "—"
@@ -564,12 +606,12 @@ export default function ExtractedData({
                               title={
                                 editingKey === key
                                   ? "Finish editing"
-                                  : `Edit ${formatLabel(key)}`
+                                  : `Edit ${fieldLabels[key] || readableFieldLabel(key)}`
                               }
                               aria-label={
                                 editingKey === key
-                                  ? `Finish editing ${formatLabel(key)}`
-                                  : `Edit ${formatLabel(key)}`
+                                  ? `Finish editing ${fieldLabels[key] || readableFieldLabel(key)}`
+                                  : `Edit ${fieldLabels[key] || readableFieldLabel(key)}`
                               }
                               onClick={() =>
                                 setEditingKey((current) =>
@@ -595,7 +637,7 @@ export default function ExtractedData({
               <div className="extracted-form-view">
                 {fields.map(([key, value]) => (
                   <label className="extracted-form-field" key={key}>
-                    <span>{formatLabel(key)}</span>
+                    <span>{fieldLabels[key] || readableFieldLabel(key)}</span>
 
                     <input
                       type="text"

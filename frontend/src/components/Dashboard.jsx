@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   LayoutDashboard,
   FilePlus2,
@@ -11,15 +11,11 @@ import {
   Settings,
   LogOut,
   Box,
-  Bell,
   GraduationCap,
   TreeDeciduous,
   Clock3,
   FileCheck,
   Plus,
-  MessageCircle,
-  Send,
-  X,
   ArrowUpRight,
   RefreshCw,
   FileText,
@@ -27,40 +23,22 @@ import {
   Menu,
 } from "lucide-react";
 
-import { createClient } from "@supabase/supabase-js";
-import ReactMarkdown from "react-markdown";
+import { supabase } from "../lib/supabase";
+import { canAccessPage, ROLE_LABELS, normalizeRole } from "../auth/roles";
+import AppGlobalHeader from "./AppGlobalHeader";
 import "./Dashboard.css";
 
-// FastAPI + Ollama backend
-const API_BASE_URL = (
-  import.meta.env.VITE_API_URL || "http://localhost:8000"
-).replace(/\/+$/, "");
-
-// Supabase connection
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-const supabase =
-  supabaseUrl && supabaseKey
-    ? createClient(supabaseUrl, supabaseKey)
-    : null;
-
-// Fix escaped Markdown characters returned by the AI
-function cleanReply(text) {
-  return String(text || "")
-    .replace(/\\([*_#])/g, "$1")
-    .trim();
-}
 
 const menuItems = [
   { label: "Dashboard", icon: LayoutDashboard, page: "dashboard" },
-  { label: "Add Certificate", icon: FilePlus2, page: "certificateType" },
-  { label: "Extracted Data", icon: FileText, page: "extractedDataMenu" },
+  { label: "Upload Certificate", icon: FilePlus2, page: "certificateType" },
+  { label: "Certificate Database", icon: Files, page: "extractedDataMenu" },
   { label: "My Certificates", icon: Files, page: "myCertificates" },
   { label: "Students", icon: Users, page: "students" },
   { label: "Search", icon: Search, page: "search" },
   { label: "Reports", icon: ChartColumn, page: "reports" },
   { label: "AI Assistant", icon: Bot, page: "aiAssistant" },
+  { label: "User Management", icon: ShieldCheck, page: "userManagement" },
   { label: "Settings", icon: Settings, page: "settings" },
 ];
 
@@ -94,74 +72,22 @@ const statusClass = (status) => {
   return "pending";
 };
 
-// Answer questions that can be calculated from loaded dashboard data
-function getDashboardAnswer(question, stats, displayName) {
-  const q = question.toLowerCase().trim();
-
-  const asksPendingCount =
-    /\b(how many|count|number|total|show|list)\b/.test(q) &&
-    /\b(pending|unverified|awaiting verification)\b/.test(q);
-
-  const asksStudentCount =
-    /\b(how many|count|number|total)\b/.test(q) &&
-    /\b(students|student names)\b/.test(q);
-
-  const asksCertificateCount =
-    /\b(how many|count|number|total)\b/.test(q) &&
-    /\b(certificates|certificate records)\b/.test(q);
-
-  const asksTodayUploads =
-    /\b(today|today's|uploaded today)\b/.test(q) &&
-    /\b(upload|uploads|uploaded|certificate)\b/.test(q);
-
-  if (asksPendingCount) {
-    return `There are ${stats.pendingCount} pending certificate records in the currently loaded dashboard data.`;
-  }
-
-  if (asksStudentCount) {
-    return `There are ${stats.uniqueStudents} unique student names in the currently loaded certificate records.`;
-  }
-
-  if (asksCertificateCount) {
-    return `There are ${stats.totalCertificates} certificate records currently loaded from Supabase.`;
-  }
-
-  if (asksTodayUploads) {
-    return `Today's upload count is ${stats.todayUploads}, based on the available certificate date fields.`;
-  }
-
-  if (/^(hi|hello|hey)\b[!. ]*$/.test(q)) {
-    return `Hello ${displayName}! How can I help you with SMART ERP today?`;
-  }
-
-  return null;
-}
-
 export default function Dashboard({
   user,
+  userRole,
   onNavigate = () => {},
   onUpload = () => {},
   onLogout = () => {},
+  onGlobalSearch = () => {},
+  logoutLoading = false,
 }) {
   const [certificates, setCertificates] = useState([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
 
-  const [chatOpen, setChatOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [chatInput, setChatInput] = useState("");
-  const [chatBusy, setChatBusy] = useState(false);
-
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      text: "Hi! Welcome to SMART ERP. 👋 Ask me about OCR, certificates, students, or your dashboard.",
-    },
-  ]);
-
-  const chatEndRef = useRef(null);
-  const chatInputRef = useRef(null);
-  const requestControllerRef = useRef(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const userId = user?.id;
 
   // Load certificate records from Supabase
   const loadCertificates = useCallback(async () => {
@@ -169,17 +95,17 @@ export default function Dashboard({
     setErrorMessage("");
 
     try {
-      if (!supabase) {
+      if (!supabase || !userId) {
         throw new Error(
           "Supabase credentials missing. Check your frontend/.env file."
         );
       }
 
-      const { data, error } = await supabase
+      let query = supabase
         .from("certificates")
         .select("*")
-        .order("created_at", { ascending: false })
-        .limit(500);
+      if (userRole === "student") query = query.eq("student_user_id", userId);
+      const { data, error } = await query.order("created_at", { ascending: false }).limit(500);
 
       if (error) throw error;
 
@@ -193,26 +119,13 @@ export default function Dashboard({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [userId, userRole]);
 
   useEffect(() => {
+    // Initial dashboard load starts the Supabase request and its loading state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadCertificates();
   }, [loadCertificates]);
-
-  // Scroll to the latest chatbot message
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "end",
-    });
-  }, [messages, chatOpen, chatBusy]);
-
-  // Cancel an active request when Dashboard unmounts
-  useEffect(() => {
-    return () => {
-      requestControllerRef.current?.abort();
-    };
-  }, []);
 
   const displayName =
     user?.user_metadata?.full_name ||
@@ -220,7 +133,9 @@ export default function Dashboard({
     user?.email?.split("@")[0] ||
     "Student";
 
-  const roleName = user?.user_metadata?.role || "Student";
+  const trustedRole = normalizeRole(userRole);
+  const roleName = ROLE_LABELS[trustedRole] || "Unassigned";
+  const visibleMenuItems = menuItems.filter(({ page }) => canAccessPage(trustedRole, page));
 
   const today = new Date();
 
@@ -302,135 +217,7 @@ export default function Dashboard({
       return;
     }
 
-    if (page === "aiAssistant") {
-      setChatOpen(true);
-      return;
-    }
-
     onNavigate(page);
-  };
-
-  // Send messages to the local Ollama AI through FastAPI
-  const sendMessage = async (event) => {
-    event.preventDefault();
-
-    const question = chatInput.trim();
-
-    if (!question || chatBusy) return;
-
-    const history = messages.slice(-10).map((message) => ({
-      role: message.role === "assistant" ? "assistant" : "user",
-      content: message.text,
-    }));
-
-    setMessages((previous) => [
-      ...previous,
-      { role: "user", text: question },
-    ]);
-
-    setChatInput("");
-    setChatBusy(true);
-
-    const controller = new AbortController();
-    requestControllerRef.current = controller;
-
-    try {
-      // Answer simple count questions using loaded Supabase data
-      const dashboardAnswer = getDashboardAnswer(
-        question,
-        {
-          pendingCount,
-          uniqueStudents,
-          totalCertificates: certificates.length,
-          todayUploads,
-        },
-        displayName
-      );
-
-      let answer = dashboardAnswer;
-
-      // Send other questions to the local AI
-      if (!answer) {
-        const apiUrl = `${API_BASE_URL}/api/ai/chat`;
-
-        console.log("SMART ERP chatbot API:", apiUrl);
-        console.log("Chat question:", question);
-
-        const response = await fetch(apiUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            message: question,
-            history,
-          }),
-          signal: controller.signal,
-        });
-
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-          throw new Error(
-            data.detail ||
-              `AI request failed with status ${response.status}`
-          );
-        }
-
-        answer = cleanReply(
-          data.reply || data.response || data.answer || ""
-        );
-
-        if (!answer) {
-          throw new Error("The AI returned an empty response.");
-        }
-      }
-
-      if (controller.signal.aborted) return;
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          text: cleanReply(answer),
-        },
-      ]);
-    } catch (error) {
-      if (error.name === "AbortError") return;
-
-      console.error("SMART ERP chatbot error:", error);
-
-      let errorText;
-
-      if (error instanceof TypeError) {
-        errorText =
-          "Cannot connect to the AI backend. Check that FastAPI is running on port 8000 and verify the backend CORS settings.";
-      } else {
-        errorText =
-          error.message || "Something went wrong. Please try again.";
-      }
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          text: `Sorry, ${errorText}`,
-        },
-      ]);
-    } finally {
-      if (requestControllerRef.current === controller) {
-        requestControllerRef.current = null;
-        setChatBusy(false);
-      }
-    }
-  };
-
-  const closeChat = () => {
-    requestControllerRef.current?.abort();
-    requestControllerRef.current = null;
-
-    setChatBusy(false);
-    setChatOpen(false);
   };
 
   return (
@@ -445,13 +232,13 @@ export default function Dashboard({
       )}
 
       <aside
-        className={`erp-sidebar ${mobileMenuOpen ? "is-open" : ""}`}
+        className={`erp-sidebar ${mobileMenuOpen ? "is-open" : ""} ${sidebarCollapsed ? "is-collapsed" : ""}`}
       >
         <div className="erp-brand">
           <div className="erp-brand-mark">
             <Box size={25} />
           </div>
-          <span>SMART ERP</span>
+          <div className="erp-brand-copy"><span>SMART ERP</span><small>Certificate Data Extraction &amp; Management System</small></div>
         </div>
 
         <div className="erp-profile">
@@ -466,7 +253,7 @@ export default function Dashboard({
         </div>
 
         <nav className="erp-navigation">
-          {menuItems.map(({ label, icon: Icon, page }) => (
+          {visibleMenuItems.map(({ label, icon: Icon, page }) => (
             <button
               type="button"
               key={page}
@@ -485,53 +272,26 @@ export default function Dashboard({
           type="button"
           className="erp-nav-item erp-logout"
           onClick={onLogout}
+          disabled={logoutLoading}
         >
           <LogOut size={19} />
-          <span>Logout</span>
+          <span>{logoutLoading ? "Signing out..." : "Logout"}</span>
         </button>
       </aside>
 
       <main className="erp-main">
         <header className="erp-topbar">
-          <button
-            type="button"
-            className="erp-mobile-menu"
-            aria-label="Open sidebar"
-            onClick={() => setMobileMenuOpen(true)}
-          >
+          <button type="button" className="erp-mobile-menu" aria-label={mobileMenuOpen ? "Close sidebar" : "Toggle sidebar"} onClick={() => {
+            if (window.matchMedia("(max-width: 760px)").matches) setMobileMenuOpen((open) => !open);
+            else setSidebarCollapsed((collapsed) => !collapsed);
+          }}>
             <Menu size={22} />
           </button>
 
-          <button
-            type="button"
-            className="erp-global-search"
-            onClick={() => navigateTo("search")}
-          >
-            <Search size={19} />
-            <span>Search certificates, students...</span>
-          </button>
-
-          <div className="erp-topbar-right">
-            <button
-              type="button"
-              className="erp-icon-button"
-              aria-label="Notifications"
-              onClick={() =>
-                window.alert("You have no new notifications.")
-              }
-            >
-              <Bell size={19} />
-            </button>
-
-            <div className="erp-top-avatar">
-              {displayName.slice(0, 2).toUpperCase()}
-            </div>
-
-            <div className="erp-top-user">
-              <strong>{displayName}</strong>
-              <span>{roleName}</span>
-            </div>
-          </div>
+          <AppGlobalHeader user={user} userRole={userRole} onGlobalSearch={(query) => {
+            setMobileMenuOpen(false);
+            onGlobalSearch(query);
+          }} onNavigate={navigateTo} onLogout={onLogout} logoutLoading={logoutLoading} />
         </header>
 
         <div className="erp-content">
@@ -740,98 +500,11 @@ export default function Dashboard({
         </div>
 
         <footer className="erp-footer">
-          <Box size={19} />
-          <span>
-            SMART ERP CERTIFICATE DATA EXTRACTION AND MANAGEMENT SYSTEM
-          </span>
+          <GraduationCap size={21} />
+          <div><strong>SMART ERP</strong><span>Certificate Data Extraction &amp; Management System</span><small>© 2026 SMART ERP. All rights reserved. &nbsp; Scan • Extract • Manage • Secure</small></div>
         </footer>
       </main>
 
-      <button
-        type="button"
-        className={`erp-chat-launcher ${chatOpen ? "is-hidden" : ""}`}
-        onClick={() => setChatOpen(true)}
-        aria-label="Open AI Assistant"
-      >
-        <MessageCircle size={22} />
-        <span>AI Assistant</span>
-      </button>
-
-      {chatOpen && (
-        <section
-          className="erp-chat-window"
-          aria-label="AI Assistant chat"
-        >
-          <header className="erp-chat-header">
-            <div className="erp-chat-heading-icon">
-              <Bot size={22} />
-            </div>
-
-            <div>
-              <strong>SMART ERP Assistant</strong>
-              <span>
-                <i />
-                {chatBusy ? "Thinking..." : "Local AI Assistant"}
-              </span>
-            </div>
-
-            <button
-              type="button"
-              className="erp-chat-close"
-              onClick={closeChat}
-              aria-label="Close chat"
-            >
-              <X size={20} />
-            </button>
-          </header>
-
-          <div className="erp-chat-messages">
-            {messages.map((message, index) => (
-              <div
-                key={`${message.role}-${index}`}
-                className={`erp-chat-message ${message.role}`}
-              >
-                {message.role === "assistant" ? (
-                  <ReactMarkdown>{cleanReply(message.text)}</ReactMarkdown>
-                ) : (
-                  message.text
-                )}
-              </div>
-            ))}
-
-            {chatBusy && (
-              <div className="erp-chat-message assistant">
-                Thinking...
-              </div>
-            )}
-
-            <div ref={chatEndRef} />
-          </div>
-
-          <form className="erp-chat-form" onSubmit={sendMessage}>
-            <input
-              ref={chatInputRef}
-              value={chatInput}
-              onChange={(event) => setChatInput(event.target.value)}
-              placeholder="Ask me anything about SMART ERP..."
-              aria-label="Message the assistant"
-              disabled={chatBusy}
-            />
-
-            <button
-              type="submit"
-              disabled={!chatInput.trim() || chatBusy}
-              aria-label="Send message"
-            >
-              <Send size={18} />
-            </button>
-          </form>
-
-          <p className="erp-chat-disclaimer">
-            SMART ERP Assistant · Powered by local Ollama
-          </p>
-        </section>
-      )}
     </div>
   );
 }

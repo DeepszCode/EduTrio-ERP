@@ -85,6 +85,49 @@ def _strip_tamil(text: str) -> str:
     return re.sub(r"[\u0B80-\u0BFF\u200c\u200d]+", " ", text or "")
 
 
+def _orient_for_ocr(img: Image.Image) -> Image.Image:
+    """Use Tesseract orientation detection to correct sideways or upside-down scans."""
+    img = ImageOps.exif_transpose(img)
+    # OSD confidence is particularly low for sideways phone photos of Tamil
+    # Nadu marksheets. Compare the two readable portrait orientations using
+    # English certificate labels, which are printed on the document and give
+    # a much more reliable signal than guessing from page geometry alone.
+    if img.width > img.height:
+        try:
+            probe = img.copy()
+            probe.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+            signals = (
+                r"HIGHER\s+SECONDARY", r"SECONDARY\s+SCHOOL", r"TOTAL\s+MARKS",
+                r"NAME\s+OF\s+(?:THE\s+)?CANDIDATE", r"DATE\s+OF\s+BIRTH",
+                r"ECONOMICS", r"COMMERCE", r"ACCOUNTANCY", r"TAMIL", r"ENGLISH",
+                r"MATHEMATICS", r"202[0-9]",
+            )
+            candidates = []
+            for angle in (90, 270):
+                rotated = probe.rotate(angle, expand=True)
+                sample = pytesseract.image_to_string(rotated, lang="eng", config="--oem 3 --psm 6")
+                score = sum(bool(re.search(pattern, sample, re.I)) for pattern in signals)
+                candidates.append((score, angle))
+            best_score, best_angle = max(candidates)
+            if best_score >= 3:
+                return img.rotate(best_angle, expand=True)
+        except Exception:
+            pass
+    try:
+        orientation = pytesseract.image_to_osd(img, config="--psm 0")
+        match = re.search(r"\bRotate:\s*(\d+)\b", orientation)
+        rotation = int(match.group(1)) % 360 if match else 0
+        if rotation in {90, 180, 270}:
+            # Apply the orientation correction using an expanded quarter-turn
+            # so the full certificate remains inside the image bounds.
+            return img.rotate(rotation, expand=True)
+    except Exception:
+        # Orientation data may be unavailable (for example, missing osd.traineddata).
+        # Keep the original scan usable rather than failing certificate extraction.
+        pass
+    return img
+
+
 def _variants(img: Image.Image) -> dict:
     """Preprocessed versions of the page. ALL arrays share the same size/geometry, so a box found
     on one can be cropped from the others.
@@ -171,6 +214,8 @@ def _ocr_image(img: Image.Image) -> str:
     """Multi-pass OCR with score-based variant selection, plus high-res top & table crops for State Board marksheets."""
     started = time.perf_counter()
     print("[OCR-TIMING] _ocr_image started", flush=True)
+    img = _orient_for_ocr(img)
+    high_resolution_page = img.copy()
     img.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
     variants = _variants(img)
     best_score = -1
@@ -199,8 +244,57 @@ def _ocr_image(img: Image.Image) -> str:
         except Exception:
             best_text = ""
 
-    # Enhance Tamil Nadu State Board certificates with targeted crops
+    # Bilingual TN scans can score well in the combined language model while
+    # losing the English field labels needed by the structured parsers. Compare
+    # English-only passes by certificate-specific signals and use them only
+    # when they clearly recognize more of the document.
+    if "eng" in ocr_lang.split("+") and len(ocr_lang.split("+")) > 1:
+        signals = (
+            r"HIGHER\s+SECONDARY", r"SECONDARY\s+SCHOOL", r"TOTAL\s+MARKS",
+            r"NAME\s+OF\s+(?:THE\s+)?CANDIDATE", r"DATE\s+OF\s+BIRTH",
+            r"PHYSICS", r"CHEMISTRY", r"COMPUTER\s+SCIENCE", r"MATHEMATICS",
+        )
+        score_text = lambda value: sum(bool(re.search(pattern, value, re.I)) for pattern in signals)
+        if score_text(best_text) < len(signals):
+            english_candidates = []
+            for psm in (6, 3):
+                try:
+                    candidate = pytesseract.image_to_string(
+                        Image.fromarray(variants["plain"]), lang="eng", config=f"--oem 3 --psm {psm}"
+                    )
+                    english_candidates.append((score_text(candidate), candidate))
+                except Exception:
+                    continue
+            if english_candidates:
+                english_score, english_text = max(english_candidates, key=lambda item: item[0])
+                if english_score > score_text(best_text):
+                    best_text = english_text
+
+    # Identity and marks are printed in fixed regions on the portrait Tamil
+    # Nadu SSLC/HSE templates. Full-page OCR often merges the name with the
+    # adjacent session column or loses subject labels, so run focused crops
+    # whenever a portrait scan contains certificate-like text.
     w, h = img.size
+    if h > w and re.search(r"CANDIDATE|EXAMINATION|CERTIFICATE|TAMILNADU|TAMIL\s*NADU", best_text, re.I):
+        try:
+            identity_w, identity_h = high_resolution_page.size
+            # On SSLC certificates the session/year occupy a separate column
+            # to the right of the candidate name. Isolate the left identity
+            # block so those neighbouring digits do not contaminate the name.
+            identity_crop = high_resolution_page.crop((0, int(identity_h * 0.22), int(identity_w * 0.68), int(identity_h * 0.46)))
+            identity_crop = identity_crop.resize(
+                (identity_crop.width * 3, identity_crop.height * 3),
+                Image.Resampling.LANCZOS,
+            ).convert("L")
+            identity_crop = ImageOps.autocontrast(identity_crop)
+            identity_text = pytesseract.image_to_string(identity_crop, lang="eng", config="--oem 3 --psm 11")
+            if not re.search(r"NAME\s+OF\s+(?:THE\s+)?CANDIDATE|CANDIDATE\s*NAME", identity_text, re.I):
+                identity_text = pytesseract.image_to_string(identity_crop, lang="eng", config="--oem 3 --psm 6")
+            if re.search(r"NAME\s+OF\s+(?:THE\s+)?CANDIDATE|CANDIDATE\s*NAME|DATE\s+OF\s+BIRTH|PERMANENT\s+REGISTER", identity_text, re.I):
+                best_text += "\n--- IDENTITY CROP ---\n" + identity_text
+        except Exception:
+            pass
+
     # 1. Top crop for Serial Number (top 22% of image)
     if not re.search(r"\b(?:HSS\s*\d{7,8}|SEC\s*\d{8})\b", best_text):
         serial = _serial_crop_ocr(variants)
@@ -214,11 +308,40 @@ def _ocr_image(img: Image.Image) -> str:
         if serial:
             best_text = f"CERTIFICATE SL. NO. {serial}\n" + best_text
 
-    # 2. Table crop for Marksheet tables (height 28% to 72% with PSM 4)
-    if re.search(r"HIGHER\s+SECONDARY|SECOND\s+YEAR|FIRST\s+YEAR|SECONDARY\s+SCHOOL|X\s+STANDARD|TAMILNADU", best_text, re.I):
+    # 2. Table crop for Marksheet tables. PSM 6 often preserves each HSE score
+    # row better than PSM 4, so compare how many subjects and numeric rows each finds.
+    if re.search(
+        r"HIGHER\s+SECONDARY|SECOND\s+YEAR|FIRST\s+YEAR|SECONDARY\s+SCHOOL|X\s+STANDARD|TAMILNADU|TAMIL\s*NADU|CANDIDATE.{0,160}(?:PASSED|FOLLOWING|SUBJECTS)",
+        best_text,
+        re.I | re.S,
+    ):
         try:
             table_crop = img.crop((0, int(h * 0.28), w, int(h * 0.72)))
-            txt_table = pytesseract.image_to_string(table_crop, lang="eng", config="--oem 3 --psm 4")
+            table_crop = table_crop.resize(
+                (table_crop.width * 2, table_crop.height * 2),
+                Image.Resampling.LANCZOS,
+            )
+            table_candidates = []
+            subject_patterns = (
+                r"TAMIL", r"ENGLISH", r"MATHEMATICS", r"PHYSICS", r"CHEMISTRY",
+                r"BIOLOGY", r"COMMERCE", r"ACCOUNTANCY", r"ECONOMICS",
+                r"COMPUTER\s+SCIENCE", r"COMPUTER\s+APPLICATIONS", r"HISTORY",
+            )
+            for psm in (6, 4):
+                candidate = pytesseract.image_to_string(
+                    table_crop, lang="eng", config=f"--oem 3 --psm {psm}"
+                )
+                subject_hits = sum(bool(re.search(rf"\b(?:{pattern})\b", candidate, re.I)) for pattern in subject_patterns)
+                mark_rows = sum(bool(re.search(r"\b\d{2,3}\s+\d{2,3}\s+\d{2,3}\b", line)) for line in candidate.splitlines())
+                table_candidates.append((subject_hits, mark_rows, candidate))
+            # PSM 6 keeps the score row aligned with its subject on TN HSE
+            # certificates. Prefer it when it recognizes a usable set of rows;
+            # PSM 4 is a fallback for scans where PSM 6 finds too little text.
+            psm6_candidate, psm4_candidate = table_candidates
+            if psm6_candidate[0] >= 4 and psm6_candidate[1] >= 3:
+                txt_table = psm6_candidate[2]
+            else:
+                _, _, txt_table = max(table_candidates, key=lambda item: (item[0], item[1]))
             if re.search(r"\b(?:TAMIL|ENGLISH|MATHEMATICS|PHYSICS|CHEMISTRY|SCIENCE|COMMERCE)\b", txt_table, re.I):
                 best_text += "\n--- TABLE CROP ---\n" + txt_table
         except Exception:
@@ -490,6 +613,7 @@ _HSS_SUBJECTS = [
     ("biology", r"BIOLOGY"),
     ("mathematics", r"MATHEMATICS|MATHS?"),
     ("computer_science", r"COMPUTER\s+SCIENCE"),
+    ("computer_applications", r"COMPUTER\s+APPLICATIONS"),
     ("commerce", r"COMMERCE"),
     ("accountancy", r"ACCOUNTANCY"),
     ("economics", r"ECONOMICS"),
@@ -503,7 +627,23 @@ _HSS_SUBJECTS = [
 ]
 
 # Science subjects in TN State Board that have practical marks
-_PRACTICAL_SUBJECTS = {"physics", "chemistry", "biology", "computer_science", "botany", "zoology"}
+_PRACTICAL_SUBJECTS = {"physics", "chemistry", "biology", "computer_science", "computer_applications", "botany", "zoology"}
+
+
+def _state_board_group_category(text: str, group_code: Optional[str]) -> Optional[str]:
+    """Identify one of the State Board HSE groups from its printed code or subjects."""
+    code_categories = {"2502": "Computer Science", "2503": "Biology", "2702": "Arts"}
+    if group_code in code_categories:
+        return code_categories[group_code]
+
+    upper = text.upper()
+    if re.search(r"\b(?:BIOLOGY|BOTANY|ZOOLOGY)\b", upper):
+        return "Biology"
+    if re.search(r"\bCOMPUTER\s+SCIENCE\b", upper):
+        return "Computer Science"
+    if re.search(r"\b(?:ACCOUNTANCY|COMMERCE|ECONOMICS|HISTORY|COMPUTER\s+APPLICATIONS|POLITICAL\s+SCIENCE)\b", upper):
+        return "Arts"
+    return None
 
 
 def _tn_lines(text: str) -> List[str]:
@@ -635,6 +775,7 @@ def _tn_header(text: str) -> dict:
         "medium_of_instruction": None,
         "group_code": None,
         "group_name": None,
+        "group_category": None,
         "exam_year": None,
         "session": None,
         "examination_board": "State Board of School Examinations, Tamil Nadu",
@@ -757,20 +898,31 @@ def _tn_header(text: str) -> dict:
                 break
     if re.search(r"GENERAL\s+EDUCATION|(?:GENE\w*\s+)?RAL\s+EDUCATION|GENERAL|பொதுக்கல்வி", text, re.I):
         h["group_name"] = "GENERAL EDUCATION"
+    h["group_category"] = _state_board_group_category(text, h["group_code"])
 
     # 10. Year & Session
     m_yr = re.search(r"\b(MARCH|APRIL|MAY|JUNE|JULY|SEPTEMBER|OCTOBER|MAR)\s*[-/ ]?\s*(20\d{2})\b", text, re.I)
     if m_yr:
         h["session"] = m_yr.group(1).upper()
-        h["exam_year"] = int(m_yr.group(2))
+        matched_year = int(m_yr.group(2))
+        plausible_years = [
+            int(year)
+            for year in re.findall(r"\b(20\d{2})\b", text)
+            if int(year) <= datetime.now().year + 1
+        ]
+        # The certificate repeats the passing session across each subject row.
+        # Prefer the most frequent plausible year when a header digit is
+        # misread (for example, 2022 as 2072) and correct elsewhere on the page.
+        if plausible_years:
+            frequent_year = max(set(plausible_years), key=plausible_years.count)
+            if matched_year > datetime.now().year + 1 or plausible_years.count(frequent_year) > plausible_years.count(matched_year):
+                matched_year = frequent_year
+        h["exam_year"] = matched_year
 
     # 11. Father Name and Mother Name
     for i, l in enumerate(lines):
         if re.search(r"FATHER|தந்தை", l, re.I):
             for j in range(i + 1, min(i + 6, len(lines))):
-                if re.search(r"காகிலா|கோகிலா|KOKILA", lines[j]):
-                    h["mother_name"] = "KOKILA"
-
                 clean = _strip_tamil(lines[j])
                 clean = re.sub(r"[^A-Za-z0-9\s.‘\'\"]", " ", clean).strip()
                 parts = re.split(r"[\s]{2,}|[|‘'\",]+", clean)
@@ -797,9 +949,6 @@ def _tn_header(text: str) -> dict:
         for i, l in enumerate(lines):
             if re.search(r"MOTHER|தாயார்", l, re.I):
                 for j in range(i + 1, min(i + 6, len(lines))):
-                    if re.search(r"காகிலா|கோகிலா|KOKILA", lines[j]):
-                        h["mother_name"] = "KOKILA"
-                        break
                     clean = _strip_tamil(lines[j]).strip()
                     m_m = re.search(r"\b([A-Z]{3,}(?:\s+[A-Z0-9\.]+)*)\b", clean)
                     if m_m and not re.search(r"GOVERNMENT|SCHOOL|EXAM|CERTIFICATE|DATE|PASS|FATHER|MOTHER", m_m.group(1), re.I):
@@ -1196,6 +1345,7 @@ def parse_state_11th(text: str) -> dict:
         "medium_of_instruction": h["medium_of_instruction"],
         "group_code": h.get("group_code"),
         "group_name": h.get("group_name"),
+        "group_category": h.get("group_category"),
         "tmr_code_number": h.get("tmr_code_number"),
         "tmr_code_date": h.get("tmr_code_date"),
         "emis_id": h["emis_id"],
@@ -1269,6 +1419,7 @@ def parse_state_12th(text: str) -> dict:
         "medium_of_instruction": h["medium_of_instruction"],
         "group_code": h.get("group_code"),
         "group_name": h.get("group_name"),
+        "group_category": h.get("group_category"),
         "tmr_code_number": h.get("tmr_code_number"),
         "tmr_code_date": h.get("tmr_code_date"),
         "emis_id": h["emis_id"],
@@ -2168,6 +2319,22 @@ def validate_state_12th(d: dict, text: str = "") -> List[str]:
         warns.append("Candidate name not found on marksheet.")
     if d.get("total_marks") is None:
         warns.append("Total marks could not be verified.")
+    group = str(d.get("group_category") or "").strip().casefold()
+    expected_by_group = {
+        "biology": ("tamil", "english", "physics", "chemistry", "biology", "mathematics"),
+        "computer science": ("tamil", "english", "physics", "chemistry", "computer_science", "mathematics"),
+        "arts": ("tamil", "english", "economics", "commerce", "accountancy", "computer_applications"),
+    }
+    expected_subjects = expected_by_group.get(group, ())
+    if expected_subjects:
+        missing = [subject.replace("_", " ").title() for subject in expected_subjects if d.get(f"{subject}_marks") is None]
+        if missing:
+            warns.append("Could not confidently extract these group subjects: " + ", ".join(missing) + ". Review the marks table before saving.")
+        subject_totals = [d.get(f"{subject}_marks") for subject in expected_subjects]
+        if d.get("total_marks") is not None and not missing:
+            calculated = sum(float(value) for value in subject_totals)
+            if abs(float(d["total_marks"]) - calculated) > 1:
+                warns.append(f"Subject marks total ({calculated:g}) does not match the printed total ({float(d['total_marks']):g}). Review the table before saving.")
     return warns
 
 

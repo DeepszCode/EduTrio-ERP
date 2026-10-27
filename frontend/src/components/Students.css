@@ -130,6 +130,20 @@
   margin-bottom: 25px;
 }
 
+.students-invite-toggle { flex-shrink: 0; color: #1758c7; border-color: #c9daf5; }
+.students-invite-form { display: grid; grid-template-columns: minmax(210px, 1fr) minmax(230px, 1.2fr) auto; align-items: end; gap: 14px; margin: -8px 0 22px; padding: 16px; border: 1px solid #cfe0f6; border-radius: 12px; background: #fff; box-shadow: 0 4px 16px rgba(31,63,108,.04); }
+.students-invite-copy { display: flex; flex-direction: column; gap: 5px; }
+.students-invite-copy strong { color: #17365f; font-size: 14px; }
+.students-invite-copy span { color: #7283a0; font-size: 11px; line-height: 1.5; }
+.students-invite-field { display: grid; gap: 6px; color: #435a7b; font-size: 11px; font-weight: 650; }
+.students-invite-field input { width: 100%; min-height: 39px; padding: 0 11px; border: 1px solid #d6e1f0; border-radius: 8px; outline: none; color: #18385f; font: inherit; font-size: 12px; }
+.students-invite-field input:focus { border-color: #4f84e8; box-shadow: 0 0 0 3px #4f84e81a; }
+.students-invite-submit { min-height: 39px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 0 13px; border: 0; border-radius: 8px; background: linear-gradient(110deg,#2864d7,#4a53df); color: #fff; font-size: 11px; font-weight: 700; cursor: pointer; }
+.students-invite-submit:disabled { opacity: .65; cursor: wait; }
+.students-invite-error, .students-invite-success { grid-column: 1 / -1; margin: 0; font-size: 12px; line-height: 1.5; }
+.students-invite-error { color: #b42318; }
+.students-invite-success { color: #087443; }
+
 .students-eyebrow {
   display: block;
   margin-bottom: 9px;
@@ -691,3 +705,27 @@
     flex-wrap: wrap;
   }
 }
+
+@media (max-width: 760px) {
+  .students-invite-form { grid-template-columns: minmax(0, 1fr); align-items: stretch; }
+  .students-invite-error, .students-invite-success { grid-column: auto; }
+}
+
+.students-invitations-card { margin: 18px 0; padding: 17px; border: 1px solid #e1eaf5; border-radius: 13px; background: #fff; box-shadow: 0 5px 18px #193c6d0c; }
+.students-invitations-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.students-invitations-heading > div { display: grid; gap: 4px; }
+.students-invitations-heading strong { color: #193e75; font-size: 15px; }
+.students-invitations-heading span { color: #71829a; font-size: 11px; }
+.students-invitations-list { display: grid; }
+.students-invitations-list > p { color: #74859b; font-size: 12px; }
+.students-invitation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px; padding: 10px 2px; border-top: 1px solid #edf1f7; }
+.students-invitation-row > div { display: grid; gap: 4px; min-width: 0; }
+.students-invitation-row strong { overflow-wrap: anywhere; color: #284a75; font-size: 12px; }
+.students-invitation-row small { color: #7b8ca2; font-size: 10px; }
+.students-invitation-status { padding: 4px 8px; border-radius: 99px; background: #edf2f8; color: #586b83; font-size: 10px; text-transform: capitalize; }
+.students-invitation-status.status-pending { background: #fff3d8; color: #9a6700; }
+.students-invitation-status.status-accepted { background: #e5f8ee; color: #178354; }
+.students-invitation-status.status-revoked, .students-invitation-status.status-expired, .students-invitation-status.status-failed { background: #fff0ef; color: #a8453d; }
+.students-invitation-row > button { min-height: 30px; padding: 0 10px; border: 1px solid #f0cccc; border-radius: 7px; background: #fff7f7; color: #a64444; font-size: 11px; cursor: pointer; }
+.students-invitation-row > button:disabled { opacity: .6; cursor: wait; }
+@media (max-width: 560px) { .students-invitation-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; } .students-invitation-row > button { grid-column: 2; } }

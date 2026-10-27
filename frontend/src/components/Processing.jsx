@@ -6,6 +6,23 @@ const API_BASE_URL = (
   import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
 ).replace(/\/+$/, "");
 
+async function getActiveSession(supabase, forceRefresh = false) {
+  if (!supabase) {
+    throw new Error("Supabase is not configured. Check the frontend environment settings.");
+  }
+
+  if (!forceRefresh) {
+    const { data, error } = await supabase.auth.getSession();
+    if (!error && data.session?.access_token) return data.session;
+  }
+
+  const { data, error } = await supabase.auth.refreshSession();
+  if (error || !data.session?.access_token) {
+    throw new Error("Your login session has expired. Please sign in again.");
+  }
+  return data.session;
+}
+
 function getDocType(certificate) {
   const name = (
     certificate?.certificateType ||
@@ -81,11 +98,11 @@ function getDocType(certificate) {
 export default function Processing({
   certificate,
   documentData,
+  supabase,
   onBack,
   onNext,
 }) {
   const [progress, setProgress] = useState(0);
-  const [activeStep, setActiveStep] = useState(0);
   const [error, setError] = useState("");
   const [status, setStatus] = useState(
     "Connecting to the OCR backend..."
@@ -104,6 +121,7 @@ export default function Processing({
     "Data Extraction",
     "Validation",
   ];
+  const activeStep = progress >= 100 ? 4 : progress < 20 ? 0 : progress < 40 ? 1 : progress < 60 ? 2 : progress < 80 ? 3 : 4;
 
   useEffect(() => {
     let cancelled = false;
@@ -116,7 +134,6 @@ export default function Processing({
       try {
         setError("");
         setProgress(5);
-        setActiveStep(0);
         setStatus("Connecting to the OCR backend...");
 
         const file = documentData?.file;
@@ -144,14 +161,26 @@ export default function Processing({
         const formData = new FormData();
         formData.append("file", file);
 
-        const response = await fetch(
+        const sendRequest = (accessToken) => fetch(
           `${API_BASE_URL}/extract/${encodeURIComponent(docType)}`,
           {
             method: "POST",
             body: formData,
+            headers: { Authorization: `Bearer ${accessToken}` },
             signal: controller.signal,
           }
         );
+
+        let session = await getActiveSession(supabase);
+        let response = await sendRequest(session.access_token);
+        if (response.status === 401) {
+          session = await getActiveSession(supabase, true);
+          response = await sendRequest(session.access_token);
+        }
+        if (response.status === 401) {
+          await supabase.auth.signOut();
+          throw new Error("Your login session is no longer valid. Please sign in again.");
+        }
 
         const responseText = await response.text();
         let result;
@@ -181,7 +210,6 @@ export default function Processing({
         timer = null;
 
         setProgress(100);
-        setActiveStep(4);
         setStatus("Certificate data extracted successfully!");
 
         navigationTimer = setTimeout(() => {
@@ -197,10 +225,11 @@ export default function Processing({
           timer = null;
         }
 
-        setError(
-          err.message ||
-            "Unable to process the certificate. Please try again."
-        );
+        const message =
+          err instanceof TypeError || /failed to fetch/i.test(err.message || "")
+            ? `Cannot connect to the OCR backend at ${API_BASE_URL}. Check that FastAPI is running and VITE_API_URL points to this computer.`
+            : err.message || "Unable to process the certificate. Please try again.";
+        setError(message);
 
         setStatus("Processing failed");
       }
@@ -215,25 +244,7 @@ export default function Processing({
       if (timer) clearInterval(timer);
       if (navigationTimer) clearTimeout(navigationTimer);
     };
-  }, [certificate, documentData]);
-
-  useEffect(() => {
-    if (error) return;
-
-    if (progress >= 100) {
-      setActiveStep(4);
-    } else if (progress < 20) {
-      setActiveStep(0);
-    } else if (progress < 40) {
-      setActiveStep(1);
-    } else if (progress < 60) {
-      setActiveStep(2);
-    } else if (progress < 80) {
-      setActiveStep(3);
-    } else {
-      setActiveStep(4);
-    }
-  }, [progress, error]);
+  }, [certificate, documentData, supabase]);
 
   return (
     <div className="processing-page">

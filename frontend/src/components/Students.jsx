@@ -9,9 +9,13 @@ import {
   RefreshCw,
   CircleAlert,
   ShieldCheck,
+  UserPlus,
+  Send,
 } from "lucide-react";
 
 import "./Students.css";
+
+const API_BASE_URL = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
 function parseOcrResult(value) {
   if (!value) return {};
@@ -183,12 +187,37 @@ function mapStudents(records) {
   );
 }
 
-export default function Students({ onBack, supabase, user }) {
+export default function Students({ onBack, supabase, user, userRole = "student" }) {
   const [search, setSearch] = useState("");
   const [certificates, setCertificates] = useState([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [inviteMessage, setInviteMessage] = useState("");
+  const [inviteError, setInviteError] = useState("");
+  const [invitations, setInvitations] = useState([]);
+  const [invitationsLoading, setInvitationsLoading] = useState(false);
+  const [revokingInvitation, setRevokingInvitation] = useState(null);
+
+  const loadInvitations = useCallback(async () => {
+    if (!supabase || !["admin", "staff"].includes(userRole)) return;
+    setInvitationsLoading(true);
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !session?.access_token) throw new Error("Your session has expired. Sign in again.");
+      const response = await fetch(`${API_BASE_URL}/api/invitations/students`, { headers: { Authorization: `Bearer ${session.access_token}` } });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "Could not load invitations.");
+      setInvitations(body.invitations || []);
+    } catch (error) {
+      setInviteError(error?.message || "Could not load invitations.");
+    } finally {
+      setInvitationsLoading(false);
+    }
+  }, [supabase, userRole]);
 
   const loadStudents = useCallback(async () => {
     setLoading(true);
@@ -225,8 +254,8 @@ export default function Students({ onBack, supabase, user }) {
         .select("*")
         .order("created_at", { ascending: false });
 
-      // Keep records scoped to the signed-in user.
-      query = query.eq("user_id", currentUser.id);
+      // Students see only certificates explicitly linked to their auth account.
+      if (userRole === "student") query = query.eq("student_user_id", currentUser.id);
 
       const { data, error } = await query;
 
@@ -242,11 +271,13 @@ export default function Students({ onBack, supabase, user }) {
     } finally {
       setLoading(false);
     }
-  }, [supabase, user]);
+  }, [supabase, user, userRole]);
 
   useEffect(() => {
     loadStudents();
   }, [loadStudents, refreshKey]);
+
+  useEffect(() => { loadInvitations(); }, [loadInvitations]);
 
   const studentRecords = useMemo(
     () => mapStudents(certificates),
@@ -266,6 +297,58 @@ export default function Students({ onBack, supabase, user }) {
 
   const refreshStudents = () => {
     setRefreshKey((value) => value + 1);
+  };
+
+  const sendStudentInvitation = async (event) => {
+    event.preventDefault();
+    setInviteMessage("");
+    setInviteError("");
+    const email = inviteEmail.trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      setInviteError("Enter a valid student email address.");
+      return;
+    }
+    setInviteLoading(true);
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !session?.access_token) throw new Error("Your Staff session has expired. Sign in again.");
+      const response = await fetch(`${API_BASE_URL}/api/invitations/students`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ email }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "Could not send the student invitation.");
+      setInviteMessage(body.message || `Invitation sent to ${email}.`);
+      setInviteEmail("");
+      await loadInvitations();
+    } catch (error) {
+      setInviteError(error?.message || "Could not send the invitation.");
+    } finally {
+      setInviteLoading(false);
+    }
+  };
+
+  const revokeInvitation = async (invitationId) => {
+    setRevokingInvitation(invitationId);
+    setInviteError("");
+    setInviteMessage("");
+    try {
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !session?.access_token) throw new Error("Your session has expired. Sign in again.");
+      const response = await fetch(`${API_BASE_URL}/api/invitations/students/${invitationId}/revoke`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || "Could not revoke this invitation.");
+      setInviteMessage("Student invitation revoked.");
+      await loadInvitations();
+    } catch (error) {
+      setInviteError(error?.message || "Could not revoke this invitation.");
+    } finally {
+      setRevokingInvitation(null);
+    }
   };
 
   return (
@@ -322,7 +405,27 @@ export default function Students({ onBack, supabase, user }) {
                 Manage student records and certificate information.
               </p>
             </div>
+            {userRole === "staff" || userRole === "admin" ? (
+              <button type="button" className="students-header-button students-invite-toggle" onClick={() => { setInviteOpen((open) => !open); setInviteError(""); setInviteMessage(""); }}>
+                <UserPlus size={16} /> Invite Student
+              </button>
+            ) : null}
           </section>
+
+          {inviteOpen && (userRole === "staff" || userRole === "admin") && (
+            <form className="students-invite-form" onSubmit={sendStudentInvitation}>
+              <div className="students-invite-copy"><strong>Invite a Student</strong><span>Supabase will email a secure invitation link. The Student role is assigned only after the invited email is verified and accepted.</span></div>
+              <label className="students-invite-field"><span>Student email address</span><input type="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="student@example.com" autoComplete="email" required maxLength={254} /></label>
+              <button type="submit" className="students-invite-submit" disabled={inviteLoading}><Send size={15} />{inviteLoading ? "Sending..." : "Send Invitation"}</button>
+            </form>
+          )}
+
+          {(userRole === "staff" || userRole === "admin") && <section className="students-invitations-card">
+            <div className="students-invitations-heading"><div><strong>Student invitations</strong><span>{userRole === "admin" ? "All Staff and Admin invitations" : "Invitations sent by you"}</span></div><button type="button" className="students-header-button" onClick={loadInvitations} disabled={invitationsLoading}>{invitationsLoading ? "Refreshing…" : "Refresh"}</button></div>
+            {inviteError && <p className="students-invite-error" role="alert">{inviteError}</p>}
+            {inviteMessage && <p className="students-invite-success" role="status">{inviteMessage}</p>}
+            <div className="students-invitations-list">{invitationsLoading && !invitations.length ? <p>Loading invitations…</p> : invitations.length ? invitations.map((invitation) => <div className="students-invitation-row" key={invitation.id}><div><strong>{invitation.email}</strong><small>Invited {invitation.created_at ? new Date(invitation.created_at).toLocaleDateString() : "—"}{invitation.expires_at ? ` · Expires ${new Date(invitation.expires_at).toLocaleDateString()}` : ""}</small></div><span className={`students-invitation-status status-${invitation.status}`}>{invitation.status}</span>{invitation.status === "pending" && <button type="button" onClick={() => revokeInvitation(invitation.id)} disabled={revokingInvitation === invitation.id}>{revokingInvitation === invitation.id ? "Revoking…" : "Revoke"}</button>}</div>) : <p>No student invitations yet.</p>}</div>
+          </section>}
 
           {/* Statistics */}
           <section className="students-stats">

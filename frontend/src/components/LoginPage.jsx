@@ -1,17 +1,11 @@
 
 import { useState } from "react";
-import { createClient } from "@supabase/supabase-js";
+import { supabase } from "../lib/supabase";
+import { ROLE_LABELS, ROLES } from "../auth/roles";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-const supabase =
-  supabaseUrl && supabaseAnonKey
-    ? createClient(supabaseUrl, supabaseAnonKey)
-    : null;
-
-export default function LoginPage({ onBack, onLogin }) {
+export default function LoginPage({ onBack, onLogin, authError = "" }) {
   const [activeTab, setActiveTab] = useState("login");
+  const [selectedRole, setSelectedRole] = useState(ROLES.STUDENT);
 
   return (
     <main className="login-page">
@@ -91,10 +85,16 @@ export default function LoginPage({ onBack, onLogin }) {
             <LoginForm
               onCreateAccount={() => setActiveTab("register")}
               onLogin={onLogin}
+              selectedRole={selectedRole}
+              onRoleChange={setSelectedRole}
+              authError={authError}
             />
           ) : (
             <CreateAccount
-              onLogin={() => setActiveTab("login")}
+              onSwitchToLogin={() => setActiveTab("login")}
+              onAuthenticated={onLogin}
+              selectedRole={selectedRole}
+              onRoleChange={setSelectedRole}
             />
           )}
         </div>
@@ -134,8 +134,68 @@ export default function LoginPage({ onBack, onLogin }) {
   );
 }
 
+export function PasswordResetPage({ onComplete, onBack, invitation = false }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    if (password.length < 8) return setError("Password must contain at least 8 characters.");
+    if (password !== confirm) return setError("Passwords do not match.");
+    if (!supabase) return setError("Supabase configuration is missing.");
+    setLoading(true);
+    try {
+      const { error: updateError } = await supabase.auth.updateUser({ password });
+      if (updateError) throw updateError;
+      setMessage("Password updated. Verifying your account...");
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !session) throw sessionError || new Error("Your recovery session expired. Request a new reset link.");
+      const accepted = await onComplete(session);
+      if (accepted === false) throw new Error("Your password was updated, but your assigned role could not be verified. Sign in again or contact an administrator.");
+    } catch (err) {
+      setError(err?.message || "Unable to update your password.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return <main className="login-page password-reset-page">
+    <section className="login-info-panel"><div className="login-info-content"><div className="login-info-text"><h1>{invitation ? "Accept Your Invitation" : "Secure Your Account"}</h1><p>{invitation ? "Set your password to finish creating your SMART ERP student account." : "Choose a new password to continue using SMART ERP."}</p></div><div className="security-illustration"><SecurityIllustration /></div></div></section>
+    <section className="login-form-panel"><div className="login-container"><div className="login-card"><div className="login-heading"><h2>{invitation ? "Complete Student Registration" : "Reset Password"}</h2><p>Choose a new password for your account</p></div>
+      <form onSubmit={submit}>
+        <div className="form-group"><label htmlFor="reset-password">New password</label><div className="input-wrapper"><input id="reset-password" type="password" autoComplete="new-password" minLength={8} required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" /></div></div>
+        <div className="form-group"><label htmlFor="reset-confirm">Confirm password</label><div className="input-wrapper"><input id="reset-confirm" type="password" autoComplete="new-password" minLength={8} required value={confirm} onChange={(event) => setConfirm(event.target.value)} placeholder="Enter the password again" /></div></div>
+        {error && <p className="register-message" role="alert">{error}</p>}{message && <p className="register-message" role="status">{message}</p>}
+        <button type="submit" className="login-submit" disabled={loading}><span>{loading ? "Updating..." : invitation ? "Set Password & Accept Invitation" : "Save New Password"}</span></button>
+      </form><div className="create-account-text"><button type="button" onClick={onBack}>Back to Login</button></div>
+    </div></div></section>
+  </main>;
+}
+
 /* LOGIN FORM */
-function LoginForm({ onCreateAccount, onLogin }) {
+function RoleSelector({ selectedRole, onChange, registration = false }) {
+  return (
+    <fieldset className="role-selector">
+      <legend>{registration ? "Account role" : "Sign in as"}</legend>
+      <div className="role-options">
+        {Object.entries(ROLE_LABELS).map(([role, label]) => {
+          const disabled = registration && role === ROLES.ADMIN;
+          return <button type="button" key={role} className={`role-option${selectedRole === role ? " selected" : ""}`} aria-pressed={selectedRole === role} disabled={disabled} onClick={() => onChange(role)}>
+            <span>{label}</span>{disabled && <small>Invite only</small>}
+          </button>;
+        })}
+      </div>
+      {registration && <p className="role-help">Staff registration is limited to email addresses approved by an Admin. Students must use their Staff invitation email. Admin accounts cannot be created here.</p>}
+    </fieldset>
+  );
+}
+
+function LoginForm({ onCreateAccount, onLogin, selectedRole, onRoleChange, authError }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -180,11 +240,42 @@ function LoginForm({ onCreateAccount, onLogin }) {
       }
 
       if (data.session && onLogin) {
-        await onLogin(data.session);
+        await onLogin(data.session, selectedRole);
       }
     } catch (err) {
       setError(err?.message || "Unable to log in. Please try again.");
     } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    setError("");
+    setNotice("");
+
+    if (!supabase) {
+      setError("Supabase configuration is missing. Check your frontend .env file.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      window.sessionStorage.setItem("smart-erp-login-role", selectedRole);
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: window.location.origin,
+        },
+      });
+
+      if (oauthError) {
+        window.sessionStorage.removeItem("smart-erp-login-role");
+        setError(oauthError.message);
+        setLoading(false);
+      }
+      // Supabase redirects the browser to Google when OAuth starts successfully.
+    } catch (err) {
+      setError(err?.message || "Unable to sign in with Google. Please try again.");
       setLoading(false);
     }
   };
@@ -233,6 +324,9 @@ function LoginForm({ onCreateAccount, onLogin }) {
         <h2>Welcome Back!</h2>
         <p>Login to your SMART ERP account</p>
       </div>
+
+      <RoleSelector selectedRole={selectedRole} onChange={onRoleChange} />
+      {authError && <p className="register-message" role="alert">{authError}</p>}
 
       <form onSubmit={handleSubmit}>
         <div className="form-group">
@@ -314,6 +408,33 @@ function LoginForm({ onCreateAccount, onLogin }) {
         </button>
       </form>
 
+      <button
+        type="button"
+        className="google-login-button"
+        onClick={handleGoogleLogin}
+        disabled={loading}
+        style={{
+          width: "100%",
+          minHeight: "48px",
+          marginTop: "16px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "12px",
+          background: "#ffffff",
+          color: "#202124",
+          border: "1px solid #dadce0",
+          borderRadius: "8px",
+          fontSize: "15px",
+          fontWeight: 600,
+          cursor: loading ? "not-allowed" : "pointer",
+          opacity: loading ? 0.7 : 1,
+        }}
+      >
+        <GoogleIcon />
+        <span>{loading ? "Connecting..." : "Continue with Google"}</span>
+      </button>
+
       <div className="create-account-text">
         <span>Don't have an account?</span>
         <button type="button" onClick={onCreateAccount}>
@@ -325,7 +446,7 @@ function LoginForm({ onCreateAccount, onLogin }) {
 }
 
 /* CREATE ACCOUNT */
-function CreateAccount({ onLogin }) {
+function CreateAccount({ onSwitchToLogin, onAuthenticated, selectedRole, onRoleChange }) {
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -340,6 +461,11 @@ function CreateAccount({ onLogin }) {
     event.preventDefault();
     setError("");
     setMessage("");
+
+    if (selectedRole !== ROLES.STAFF) {
+      setError("Student accounts must be created from a valid Staff invitation. Admin accounts cannot be registered here.");
+      return;
+    }
 
     if (!supabase) {
       setError("Supabase configuration is missing. Check your frontend .env file.");
@@ -375,21 +501,28 @@ function CreateAccount({ onLogin }) {
           password,
           options: {
             data: { full_name: fullName.trim() },
-            emailRedirectTo: window.location.origin,
+            emailRedirectTo: `${window.location.origin}/?flow=staff-register`,
           },
         });
 
       if (signUpError) {
-        setError(signUpError.message);
+        const detail = signUpError.message || "Unable to create account.";
+        setError(/database error saving new user|registration requires/i.test(detail)
+          ? "This email is not approved for Staff registration. Ask an Admin to approve it first."
+          : detail);
         return;
       }
 
       if (data.session) {
-        setMessage("Account created successfully. You can now continue.");
-        if (onLogin) onLogin();
+        const activated = await onAuthenticated?.(data.session, ROLES.STAFF);
+        if (activated === false) {
+          setError("The Staff account was created, but access could not be activated. Confirm the email and Staff approval, then sign in again.");
+          return;
+        }
+        setMessage("Staff account created and verified.");
       } else {
         setMessage(
-          "Account created. Please confirm your email, then return here to log in."
+          "Staff account created. Confirm your email, then return to log in as Staff. Staff access activates after email verification."
         );
       }
     } catch (err) {
@@ -406,7 +539,13 @@ function CreateAccount({ onLogin }) {
         <p>Fill in your details to create an account</p>
       </div>
 
-      <form onSubmit={handleRegister}>
+      <RoleSelector selectedRole={selectedRole} onChange={onRoleChange} registration />
+
+      {selectedRole === ROLES.STUDENT ? (
+        <div className="register-message" role="status">
+          Student registration is invitation-only. Open the invitation email sent by your Staff member and use its secure link to set your password and activate your account.
+        </div>
+      ) : <form onSubmit={handleRegister}>
         <div className="form-group">
           <label htmlFor="register-name">
             <span className="label-icon"><UserIcon /></span>
@@ -516,14 +655,14 @@ function CreateAccount({ onLogin }) {
           className="login-submit"
           disabled={loading}
         >
-          <span>{loading ? "Creating account..." : "Create Account"}</span>
+          <span>{loading ? "Creating account..." : "Register as Staff"}</span>
           <span className="submit-arrow">→</span>
         </button>
-      </form>
+      </form>}
 
       <div className="create-account-text">
         <span>Already have an account?</span>
-        <button type="button" onClick={onLogin}>Login</button>
+        <button type="button" onClick={onSwitchToLogin}>Login</button>
       </div>
     </div>
   );
@@ -639,6 +778,17 @@ function EyeOffIcon() {
       <path d="M10.6 5.2 C11.05 5.07 11.51 5 12 5 C16 5 19.5 7 22 12 C21.2 13.6 20.2 15 19 16.1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
       <path d="M6.1 6.1 C4.4 7.2 3 9 2 12 C4.5 17 8 19 12 19 C13.7 19 15.3 18.6 16.7 17.8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
       <path d="M9.5 9.5 C8.2 10.8 8.2 13 9.5 14.5 C10.8 15.8 13 15.8 14.5 14.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function GoogleIcon() {
+  return (
+    <svg viewBox="0 0 48 48" width="20" height="20" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5Z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.74 7.18l7.65 5.93c4.46-4.12 7.13-10.2 7.13-17.58Z" />
+      <path fill="#FBBC05" d="M10.53 28.59A14.4 14.4 0 0 1 9.75 24c0-1.59.27-3.13.76-4.59l-7.98-6.19A23.9 23.9 0 0 0 0 24c0 3.87.93 7.52 2.56 10.78l7.97-6.19Z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.9-5.87l-7.65-5.93c-2.13 1.43-4.86 2.28-8.25 2.28-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48Z" />
     </svg>
   );
 }

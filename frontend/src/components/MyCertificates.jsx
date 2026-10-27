@@ -12,8 +12,6 @@ import {
 } from "lucide-react";
 import "./MyCertificates.css";
 
-const API_URL = "http://127.0.0.1:8000/certificates/";
-
 function getValue(record, keys, fallback = "") {
   for (const key of keys) {
     const value = record?.[key];
@@ -115,7 +113,7 @@ function normalizeCertificate(record, index) {
   };
 }
 
-export default function MyCertificates({ onBack }) {
+export default function MyCertificates({ onBack, supabase, user, userRole = "student" }) {
   const [records, setRecords] = useState([]);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -127,33 +125,14 @@ export default function MyCertificates({ onBack }) {
     setError("");
 
     try {
-      const response = await fetch(API_URL);
-
-      if (!response.ok) {
-        let message = `Unable to load certificate records (${response.status}).`;
-
-        try {
-          const body = await response.json();
-          if (body.detail) {
-            message = typeof body.detail === "string"
-              ? body.detail
-              : JSON.stringify(body.detail);
-          }
-        } catch {
-          // Keep the default message.
-        }
-
-        throw new Error(message);
-      }
-
-      const data = await response.json();
-      const items = Array.isArray(data)
-        ? data
-        : Array.isArray(data.items)
-          ? data.items
-          : [];
-
-      setRecords(items.map((record, index) => normalizeCertificate(record, index)));
+      if (!supabase || !user?.id) throw new Error("Sign in to view your certificate records.");
+      let query = supabase
+        .from("certificates")
+        .select("*");
+      if (userRole === "student") query = query.eq("student_user_id", user.id);
+      const { data, error: queryError } = await query.order("created_at", { ascending: false });
+      if (queryError) throw queryError;
+      setRecords((data || []).map((record, index) => normalizeCertificate(record, index)));
     } catch (err) {
       setError(
         err.message ||
@@ -162,7 +141,7 @@ export default function MyCertificates({ onBack }) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [supabase, user?.id, userRole]);
 
   useEffect(() => {
     fetchCertificates();
